@@ -16,6 +16,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set git user
         run: |
@@ -128,6 +129,10 @@ jobs:
         env:
           NOVA_PAT: ${{ secrets.NOVA_PAT }}
         run: |
+          if [[ -z "$NOVA_PAT" ]]; then
+            echo "::error::NOVA_PAT secret is not configured"
+            exit 1
+          fi
           git remote remove origin || true
           git remote add origin https://x-access-token:${NOVA_PAT}@github.com/schlingel-bernd/nova-updater.git
           git push origin HEAD:main --force
