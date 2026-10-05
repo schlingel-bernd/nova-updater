@@ -1,0 +1,1744 @@
+#!/usr/bin/env python3
+"""nova-gui — browse, install and update apps from your nova catalogs.
+
+An explorer, not a checklist. The list is expected to grow into hundreds of
+small tools, so everything here is built around finding one: live search,
+category and status filters, sorting, and a detail view per app showing its
+screenshots, dependencies, and exactly what it installs.
+
+All data comes from the CLI (`nova list --porcelain`, `nova info --porcelain`),
+which stays the single source of truth. Images are read from the app's own
+cloned repo, so nothing here fetches from the network.
+"""
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, Gio, GLib, GObject, Gdk, Pango  # noqa: E402
+
+APP_ID = "eu.novanetwork.NovaUpdater"
+
+# Adw.ActionRow titles and subtitles, and Adw.PreferencesGroup descriptions,
+# are Pango markup by default. Every one of these strings comes out of an app's
+# nova.manifest, so a description containing a bare & rendered the row empty
+# and a crafted manifest could inject markup into the row that explains why an
+# app wants root.
+esc = GLib.markup_escape_text
+
+
+def repo_path(repo_dir, rel):
+    """Resolve a manifest-supplied path inside the app's own clone.
+
+    ICON, SCREENSHOTS and ABOUT are repo-relative by convention but were joined
+    to the repo directory unchecked, so an absolute path or one with ../ read
+    any file the user can read into the dialog. Returns None unless the result
+    stays inside the clone and exists."""
+    if not repo_dir or not rel:
+        return None
+    base = os.path.realpath(repo_dir)
+    p = os.path.realpath(os.path.join(base, rel))
+    if p != base and not p.startswith(base + os.sep):
+        return None
+    return p if os.path.exists(p) else None
+
+STATUS = {
+    "installed":        ("Installed",       "ok"),
+    "update-available": ("Update",          "upd"),
+    "partial":          ("Partly installed", "warn"),
+    "not-installed":    ("",                "dim"),
+    "unreachable":      ("Unreachable",     "warn"),
+}
+
+# Icon themes disagree about what exists. Papirus, for one, ships almost none of
+# the "*-symbolic" names that Adwaita does, so hard-coding them leaves every row
+# showing the generic fallback glyph — which reads as "broken app", not "no
+# icon". Each entry is a candidate list, best first, resolved against whatever
+# theme is actually in use.
+CATEGORY_ICON = {
+    "security":    ["security-high-symbolic", "security-high",
+                    "preferences-system-privacy", "changes-prevent"],
+    "network":     ["network-wireless-symbolic", "network-wireless",
+                    "network-workgroup", "network-transmit-receive"],
+    "media":       ["applications-multimedia-symbolic", "applications-multimedia",
+                    "multimedia-player"],
+    "development": ["applications-engineering-symbolic", "applications-development",
+                    "applications-engineering", "text-x-script"],
+    "office":      ["text-editor-symbolic", "accessories-text-editor",
+                    "text-editor", "applications-office"],
+    "files":       ["folder-symbolic", "folder", "system-file-manager"],
+    "desktop":     ["preferences-other-symbolic", "preferences-desktop",
+                    "preferences-system", "applications-graphics"],
+    "system":      ["system-software-install-symbolic", "system-software-install",
+                    "applications-system", "system-run"],
+}
+COMPONENT_ICON = (
+    ("gnome-extension", ["extension-symbolic", "application-x-addon",
+                         "extension", "preferences-desktop-theme"]),
+    ("daemon",          ["emblem-system-symbolic", "applications-system", "system-run"]),
+    ("service",         ["emblem-system-symbolic", "applications-system", "system-run"]),
+    ("gui",             ["application-x-executable-symbolic", "application-x-executable"]),
+    ("cli",             ["utilities-terminal-symbolic", "utilities-terminal", "terminal"]),
+)
+FALLBACK_ICON = ["application-x-executable-symbolic", "application-x-executable",
+                 "package-x-generic", "applications-other"]
+TINTS = 6
+
+_icon_cache = {}
+
+
+def best_icon(candidates):
+    """First candidate the running theme actually has."""
+    key = tuple(candidates)
+    if key in _icon_cache:
+        return _icon_cache[key]
+    display = Gdk.Display.get_default()
+    theme = Gtk.IconTheme.get_for_display(display) if display else None
+    chosen = candidates[-1]
+    for name in candidates:
+        if theme is None or theme.has_icon(name):
+            chosen = name
+            break
+    _icon_cache[key] = chosen
+    return chosen
+
+
+def ui_icon(*candidates):
+    """For chrome icons, where a missing glyph is merely ugly rather than wrong."""
+    return best_icon(list(candidates) + ["image-missing"])
+
+CSS = b"""
+.nova-pill { border-radius: 999px; padding: 1px 9px; font-size: 0.76em; font-weight: 700; }
+.nova-pill.ok   { background: alpha(@success_color, .20); color: @success_color; }
+.nova-pill.upd  { background: alpha(@accent_bg_color, .26); color: @accent_color; }
+.nova-pill.warn { background: alpha(@warning_color, .22); color: @warning_color; }
+.nova-pill.root { background: alpha(@warning_color, .18); color: @warning_color; }
+.nova-pill.dim  { background: alpha(@window_fg_color, .10); opacity: .75; }
+
+/* a coloured tile per category, so a long list is scannable by shape and hue
+   rather than by reading every line */
+.nova-tile { border-radius: 13px; min-width: 46px; min-height: 46px; }
+.nova-tile.c0 { background: alpha(@accent_bg_color,.20); color: @accent_color; }
+.nova-tile.c1 { background: alpha(@success_color,.20);   color: @success_color; }
+.nova-tile.c2 { background: alpha(@warning_color,.20);   color: @warning_color; }
+.nova-tile.c3 { background: alpha(@purple_3,.24);        color: @purple_2; }
+.nova-tile.c4 { background: alpha(@red_3,.20);           color: @red_2; }
+.nova-tile.c5 { background: alpha(@blue_3,.22);          color: @blue_2; }
+
+.nova-hero { border-radius: 16px; padding: 18px 20px;
+             background: alpha(@accent_bg_color,.13);
+             border: 1px solid alpha(@accent_bg_color,.22); }
+.nova-hero.plain { background: alpha(@window_fg_color,.05);
+                   border-color: alpha(@window_fg_color,.08); }
+.nova-hero-num   { font-size: 1.7em; font-weight: 800; }
+.nova-hero-lbl   { font-size: .82em; opacity: .7; }
+.nova-hero-icon  { color: @accent_color; }
+
+.nova-chip { border-radius: 999px; padding: 4px 14px; font-weight: 600; }
+.nova-section { font-size: .8em; font-weight: 800; opacity: .55;
+                margin: 16px 4px 6px 4px; letter-spacing: .06em; }
+.nova-bigtile { border-radius: 20px; min-width: 96px; min-height: 96px; }
+.nova-shot { border-radius: 10px; }
+.nova-card { border-radius: 14px; padding: 14px 14px 12px 14px;
+             background: alpha(@window_fg_color, .05);
+             border: 1px solid alpha(@window_fg_color, .07); }
+.nova-card:hover { background: alpha(@window_fg_color, .09); }
+.nova-card-title { font-weight: 700; }
+.nova-card-desc  { opacity: .7; font-size: .9em; }
+.nova-dep-ok  { color: @success_color; }
+.nova-dep-bad { color: @error_color; }
+
+/* "daemon cli gui gnome-extension" as a line of words says nothing at a
+   glance; one labelled chip per component is scannable and gives each thing an
+   icon. */
+.nova-comp { border-radius: 999px; padding: 4px 11px 4px 8px;
+             background: alpha(@accent_bg_color, .14);
+             font-size: .86em; font-weight: 600; }
+
+/* A README is a document, so it gets document shapes rather than one long dim
+   paragraph. Colours come from the theme's accent, so this follows light/dark. */
+.nova-md-h1 { font-size: 1.3em;  font-weight: 800; color: @accent_color; }
+.nova-md-h2 { font-size: 1.12em; font-weight: 700; color: @accent_color; }
+.nova-md-h3 { font-weight: 700; }
+.nova-md-code { background: alpha(@window_fg_color, .07); border-radius: 8px;
+                padding: 9px 11px; }
+.nova-md-quote { border-left: 3px solid alpha(@accent_bg_color, .5);
+                 padding-left: 10px; opacity: .85; }
+.nova-shot-btn { padding: 0; }
+.nova-thumb-on { box-shadow: inset 0 0 0 2px @accent_color; }
+"""
+
+
+_MD_CODE = re.compile(r"`([^`\n]+)`")
+_MD_BOLD = re.compile(r"\*\*([^*\n]+)\*\*")
+_MD_ITAL = re.compile(r"(?<![*\w])\*([^*\n]+)\*(?!\*)")
+_MD_LINK = re.compile(r"\[([^\]\n]+)\]\(([^)\n]+)\)")
+_MD_IMG = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+
+
+def _md_inline(s):
+    """Inline markdown to Pango markup. Escaped FIRST, so nothing in the
+    document can inject markup — only then are the markers turned into tags."""
+    s = _MD_IMG.sub("", s)
+    s = esc(s)
+    s = _MD_CODE.sub(r"<tt>\1</tt>", s)
+    s = _MD_BOLD.sub(r"<b>\1</b>", s)
+    s = _MD_ITAL.sub(r"<i>\1</i>", s)
+    s = _MD_LINK.sub(r"<u>\1</u>", s)
+    return s
+
+
+def markdown_widget(text, limit=40000):
+    """A README rendered as a document rather than one long dim paragraph.
+
+    Deliberately small: headings, emphasis, inline and fenced code, lists,
+    block quotes, rules and tables-as-monospace. Colours come from CSS classes
+    so they follow the theme instead of being baked into the markup."""
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+    para, code, in_code = [], [], False
+
+    def label(markup, css=None, mono=False):
+        lbl = Gtk.Label(xalign=0, wrap=True, selectable=True, use_markup=True,
+                        label=markup)
+        lbl.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        if mono:
+            lbl.add_css_class("monospace")
+        if css:
+            lbl.add_css_class(css)
+        return lbl
+
+    def flush_para():
+        if para:
+            box.append(label(" ".join(para)))
+            para.clear()
+
+    def flush_code():
+        if code:
+            lbl = label("<tt>%s</tt>" % esc("\n".join(code)), "nova-md-code", mono=True)
+            lbl.set_wrap(False)
+            sc = Gtk.ScrolledWindow(child=lbl, vscrollbar_policy=Gtk.PolicyType.NEVER)
+            sc.add_css_class("nova-md-code")
+            box.append(sc)
+            code.clear()
+
+    for raw in text[:limit].splitlines():
+        if raw.lstrip().startswith("```"):
+            flush_para()
+            in_code = not in_code
+            if not in_code:
+                flush_code()
+            continue
+        if in_code:
+            code.append(raw)
+            continue
+        s = raw.strip()
+        if not s:
+            flush_para()
+            continue
+        if len(s) >= 3 and set(s) <= set("-=_* "):          # horizontal rule
+            flush_para()
+            box.append(Gtk.Separator(margin_top=6, margin_bottom=6))
+            continue
+        m = re.match(r"(#{1,6})\s+(.*)", s)
+        if m:
+            flush_para()
+            lvl = min(3, len(m.group(1)))
+            lbl = label(_md_inline(m.group(2)), "nova-md-h%d" % lvl)
+            lbl.set_margin_top(8 if lvl > 1 else 12)
+            box.append(lbl)
+            continue
+        if s.startswith(">"):
+            flush_para()
+            box.append(label(_md_inline(s.lstrip("> ")), "nova-md-quote"))
+            continue
+        m = re.match(r"[-*+]\s+(.*)", s) or re.match(r"(\d+)[.)]\s+(.*)", s)
+        if m:
+            flush_para()
+            body = m.group(m.lastindex)
+            lbl = label("• " + _md_inline(body))
+            lbl.set_margin_start(10)
+            box.append(lbl)
+            continue
+        if s.startswith("|"):                               # table: keep aligned
+            flush_para()
+            code.append(raw)
+            continue
+        flush_code()
+        para.append(_md_inline(s))
+
+    flush_para()
+    flush_code()
+    return box
+
+
+def component_chips(components):
+    """One chip per component, with the icon that component already maps to."""
+    parts = [c for c in (components or "").split() if c]
+    if not parts:
+        return None
+    box = Adw.WrapBox(child_spacing=7, line_spacing=7) if hasattr(Adw, "WrapBox") else \
+        Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+    for c in parts:
+        names = None
+        for key, cands in COMPONENT_ICON:
+            if key == c.lower():
+                names = cands
+                break
+        chip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                       valign=Gtk.Align.CENTER)
+        chip.add_css_class("nova-comp")
+        chip.append(Gtk.Image(icon_name=best_icon(names or FALLBACK_ICON),
+                              pixel_size=14))
+        chip.append(Gtk.Label(label=c.replace("-", " ")))
+        box.append(chip)
+    return box
+
+def find_nova():
+    for c in (shutil.which("nova"),
+              os.path.expanduser("~/.local/bin/nova"),
+              "/usr/local/bin/nova",
+              os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "nova")):
+        if c and os.path.exists(c):
+            return os.path.realpath(c)
+    return None
+
+
+def pill(text, kind, tip=None):
+    lbl = Gtk.Label(label=text, valign=Gtk.Align.CENTER)
+    lbl.add_css_class("nova-pill")
+    lbl.add_css_class(kind)
+    if tip:
+        lbl.set_tooltip_text(tip)
+    return lbl
+
+
+# Which halves of an app are in. Only for apps that use the system scope: a
+# lone USER pill on every row would be noise, and for a user-only app the
+# status pill already says everything. For a dual-scope app this is the thing
+# you could not otherwise see anywhere in the GUI — and it is what makes
+# "partly installed" mean something specific.
+SCOPE_PILL = (
+    ("user",   "USER", "ok",   "in your home directory (~/.local)"),
+    ("system", "ROOT", "root", "outside your home directory, installed as root"),
+)
+
+
+def scope_pills(app):
+    if not app.needs_root:
+        return []
+    inst = set(app.installed_list)
+    out = []
+    for scope, label, kind, where in SCOPE_PILL:
+        if scope not in app.scope_list:
+            continue
+        if scope in inst:
+            out.append(pill(label, kind, "installed %s" % where))
+        else:
+            out.append(pill(label, "dim", "NOT installed — %s" % where))
+    return out
+
+
+def icon_for(app):
+    """Category first — it says what the thing is *for*, which is what someone
+    scanning a long list is actually looking for. Components are the fallback."""
+    cat = app["category"].strip().lower()
+    if cat in CATEGORY_ICON:
+        return best_icon(CATEGORY_ICON[cat])
+    for key, names in COMPONENT_ICON:
+        if key in app["comp"]:
+            return best_icon(names)
+    return best_icon(FALLBACK_ICON)
+
+
+def tint_for(app):
+    cat = app["category"].strip().lower()
+    return "c%d" % (sum(ord(c) for c in cat) % TINTS if cat else 0)
+
+
+def tile(app, big=False):
+    """A tinted rounded tile with the icon centred inside it.
+
+    The image needs to expand and centre itself: a plain Gtk.Box lays its child
+    out at the start, so the icon sits in the corner of the tile and reads as a
+    broken glyph rather than an icon."""
+    img = Gtk.Image(icon_name=icon_for(app), pixel_size=48 if big else 26)
+    img.set_halign(Gtk.Align.CENTER)
+    img.set_valign(Gtk.Align.CENTER)
+    img.set_hexpand(True)
+    img.set_vexpand(True)
+    box = Gtk.Box()
+    box.append(img)
+    box.add_css_class("nova-bigtile" if big else "nova-tile")
+    box.add_css_class(tint_for(app))
+    box.set_halign(Gtk.Align.START)
+    box.set_valign(Gtk.Align.CENTER)
+    box.set_hexpand(False)
+    return box
+
+
+class App(GObject.Object):
+    """One app, as the CLI described it."""
+    __gtype_name__ = "NovaApp"
+
+    def __init__(self, d):
+        super().__init__()
+        self.d = d
+
+    def __getitem__(self, k):
+        return self.d.get(k, "")
+
+    @property
+    def scope_list(self):
+        return self["scopes"].split()
+
+    @property
+    def installed_list(self):
+        """The scopes this app is ACTUALLY installed in, which is not the same
+        as the scopes it uses — a dual-scope app is routinely half installed."""
+        return self["installed_scopes"].split()
+
+    @property
+    def needs_root(self):
+        return "system" in self.scope_list
+
+    @property
+    def is_installed(self):
+        return self["status"] in ("installed", "partial", "update-available")
+
+    def haystack(self):
+        return " ".join((self["name"], self["desc"], self["tags"],
+                         self["category"], self["comp"])).lower()
+
+
+class ReadmeDialog(Adw.Dialog):
+    """The README with the whole window to itself, for the long ones."""
+
+    def __init__(self, text, name):
+        super().__init__(title=name)
+        self.set_content_width(900)
+        self.set_content_height(820)
+        body = markdown_widget(text)
+        body.set_margin_top(18)
+        body.set_margin_bottom(28)
+        body.set_margin_start(18)
+        body.set_margin_end(18)
+        sc = Gtk.ScrolledWindow(child=Adw.Clamp(child=body, maximum_size=760),
+                                hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True)
+        tb = Adw.ToolbarView(content=sc)
+        tb.add_top_bar(Adw.HeaderBar())
+        self.set_child(tb)
+
+
+class ShotDialog(Adw.Dialog):
+    """The screenshots, big, with the whole set to hand.
+
+    No zoom control. These are screenshots of desktop apps, so at this size
+    they are already at or near 1:1 and a zoom widget only put chrome in front
+    of the picture. What was actually missing was a way to move around the set:
+    swipe, arrow keys, the scroll wheel, dots, and a strip showing what else
+    there is rather than leaving you to discover it."""
+
+    def __init__(self, paths, index=0):
+        super().__init__(title="Screenshots")
+        self.set_content_width(1180)
+        self.set_content_height(820)
+        self.paths = list(paths)
+        self.thumbs = []
+        if not self.paths:
+            # The detail view only offers the button when there are shots, so
+            # this is unreachable from the GUI — but a viewer with nothing to
+            # view should say so rather than raise on paths[0].
+            self.set_child(Adw.StatusPage(
+                icon_name=ui_icon("image-missing-symbolic", "image-missing"),
+                title="No screenshots"))
+            return
+        paths = self.paths
+        self._index = max(0, min(len(paths) - 1, index))
+
+        # the wheel moves between shots now that it is not spent on zooming
+        self.car = Adw.Carousel(allow_scroll_wheel=True, spacing=24,
+                                hexpand=True, vexpand=True)
+        for path in paths:
+            pic = Gtk.Picture.new_for_filename(path)
+            pic.set_content_fit(Gtk.ContentFit.CONTAIN)
+            pic.set_can_shrink(True)
+            pic.add_css_class("nova-shot")
+            self.car.append(pic)
+        self.car.connect("page-changed", self._on_page)
+
+        self.title_w = Adw.WindowTitle(title="", subtitle="")
+        header = Adw.HeaderBar()
+        header.set_title_widget(self.title_w)
+        if len(paths) > 1:
+            nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            nav.add_css_class("linked")
+            prev = Gtk.Button(icon_name=ui_icon("go-previous-symbolic", "go-previous"),
+                              tooltip_text="Previous  (\u2190)")
+            nxt = Gtk.Button(icon_name=ui_icon("go-next-symbolic", "go-next"),
+                             tooltip_text="Next  (\u2192)")
+            prev.connect("clicked", lambda *_: self._step(-1))
+            nxt.connect("clicked", lambda *_: self._step(1))
+            nav.append(prev)
+            nav.append(nxt)
+            header.pack_start(nav)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        body.append(self.car)
+        if len(paths) > 1:
+            body.append(Adw.CarouselIndicatorDots(carousel=self.car))
+            body.append(self._strip())
+
+        tb = Adw.ToolbarView(content=body)
+        tb.add_top_bar(header)
+        self.set_child(tb)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_key)
+        self.add_controller(keys)
+
+        self._on_page(self.car, self._index)
+        if self._index:
+            # the carousel has to be allocated before it can scroll anywhere
+            GLib.idle_add(self._goto, self._index)
+
+    def _strip(self):
+        """A thumbnail per shot, so the set is visible instead of being
+        something you find out about by swiping."""
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                      halign=Gtk.Align.CENTER)
+        for i, path in enumerate(self.paths):
+            pic = Gtk.Picture.new_for_filename(path)
+            pic.set_content_fit(Gtk.ContentFit.COVER)
+            pic.set_size_request(104, 62)
+            pic.add_css_class("nova-shot")
+            btn = Gtk.Button(child=pic, tooltip_text=os.path.basename(path))
+            btn.add_css_class("flat")
+            btn.add_css_class("nova-shot-btn")
+            btn.connect("clicked", lambda _b, idx=i: self._goto(idx))
+            self.thumbs.append(btn)
+            box.append(btn)
+        sc = Gtk.ScrolledWindow(child=box, vscrollbar_policy=Gtk.PolicyType.NEVER)
+        sc.set_size_request(-1, 76)
+        sc.set_margin_bottom(10)
+        return sc
+
+    def _goto(self, i):
+        i = max(0, min(len(self.paths) - 1, i))
+        page = self.car.get_nth_page(i)
+        try:
+            self.car.scroll_to(page, True)
+        except TypeError:            # libadwaita < 1.2 took no animate argument
+            self.car.scroll_to(page)
+        return False
+
+    def _step(self, by):
+        self._goto(self._index + by)
+
+    def _on_page(self, _car, index):
+        self._index = int(index)
+        self.title_w.set_title(os.path.basename(self.paths[self._index]))
+        self.title_w.set_subtitle("%d of %d" % (self._index + 1, len(self.paths))
+                                  if len(self.paths) > 1 else "")
+        for i, btn in enumerate(self.thumbs):
+            if i == self._index:
+                btn.add_css_class("nova-thumb-on")
+            else:
+                btn.remove_css_class("nova-thumb-on")
+
+    def _on_key(self, _c, keyval, _code, _state):
+        if keyval in (Gdk.KEY_Left, Gdk.KEY_Up, Gdk.KEY_Page_Up):
+            self._step(-1)
+            return True
+        if keyval in (Gdk.KEY_Right, Gdk.KEY_Down, Gdk.KEY_Page_Down, Gdk.KEY_space):
+            self._step(1)
+            return True
+        if keyval == Gdk.KEY_Home:
+            self._goto(0)
+            return True
+        if keyval == Gdk.KEY_End:
+            self._goto(len(self.paths) - 1)
+            return True
+        return False
+
+
+class DetailDialog(Adw.Dialog):
+    """Everything about one app — including the parts that should make you
+    think twice: what it installs, what it needs, and why it wants root."""
+
+    def __init__(self, win, app):
+        super().__init__(title=app["name"])
+        self.set_content_width(720)
+        self.set_content_height(780)
+        self.win = win
+        self.app = app
+
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                           margin_top=18, margin_bottom=24,
+                           margin_start=18, margin_end=18)
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                      vexpand=True)
+        scroller.set_child(Adw.Clamp(child=self.box, maximum_size=680))
+
+        tb = Adw.ToolbarView(content=scroller)
+        header = Adw.HeaderBar()
+        self.action_btn = Gtk.Button()
+        self.action_btn.add_css_class("suggested-action")
+        self.action_btn.connect("clicked", self._on_action)
+        header.pack_end(self.action_btn)
+        self.remove_btn = Gtk.Button(label="Uninstall")
+        self.remove_btn.add_css_class("destructive-action")
+        self.remove_btn.connect("clicked", lambda *_: self._run("uninstall"))
+        header.pack_end(self.remove_btn)
+        tb.add_top_bar(header)
+        self.set_child(tb)
+
+        self._build_header()
+        self._placeholder = Gtk.Spinner(spinning=True, height_request=48)
+        self.box.append(self._placeholder)
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def _build_header(self):
+        a = self.app
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+        self.big_icon = tile(a, big=True)
+        self.big_icon.set_valign(Gtk.Align.START)
+        row.append(self.big_icon)
+
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, hexpand=True)
+        title = Gtk.Label(label=a["name"], xalign=0)
+        title.add_css_class("title-1")
+        col.append(title)
+        sub = Gtk.Label(label=a["desc"], xalign=0, wrap=True)
+        sub.add_css_class("dim-label")
+        col.append(sub)
+
+        chips = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        label, kind = STATUS.get(a["status"], ("", "dim"))
+        if label:
+            chips.append(pill(label.upper(), kind))
+        for p in scope_pills(a):
+            chips.append(p)
+        if a["pinned"]:
+            chips.append(pill("PINNED %s" % a["pinned"], "warn"))
+        if a["category"]:
+            chips.append(pill(a["category"].upper(), "dim"))
+        col.append(chips)
+        row.append(col)
+        self.box.append(row)
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        st = self.app["status"]
+        self.action_btn.set_label(
+            "Update" if st == "update-available"
+            else "Complete install" if st == "partial"
+            else "Reinstall" if st == "installed" else "Install")
+        self.remove_btn.set_visible(self.app.is_installed)
+
+    def _on_action(self, *_):
+        self._run("update" if self.app["status"] == "update-available" else "install")
+
+    def _run(self, verb):
+        self.close()
+        self.win.run_action(verb, [self.app["name"]])
+
+    # ---- how this app tracks versions ------------------------------------
+    def _version_group(self, info):
+        """ref= on a list entry has always existed; `nova pin` made it a
+        command. It belongs here too: "stay on this version" is a decision you
+        make while looking at an app, not while editing a list file."""
+        g = Adw.PreferencesGroup(
+            title="Updates",
+            description="Pinned apps are left alone by updates until you unpin them.")
+        pinned = info.get("pinned", "")
+        if pinned:
+            r = Adw.ActionRow(title="Pinned",
+                              subtitle=esc("held at %s" % pinned))
+            b = Gtk.Button(label="Unpin", valign=Gtk.Align.CENTER)
+            b.add_css_class("flat")
+            b.connect("clicked", lambda *_: self._pin(""))
+            r.add_suffix(b)
+            g.add(r)
+        else:
+            r = Adw.EntryRow(title="Pin to a tag or branch")
+            r.set_show_apply_button(True)
+            r.connect("apply", lambda w: self._pin(w.get_text().strip()))
+            g.add(r)
+        return g
+
+    def _pin(self, ref):
+        name = self.app["name"]
+        self.close()
+        self.win.run_cli(["pin", name, ref] if ref else ["unpin", name])
+
+    # ---- what is about to run -------------------------------------------
+    def _inspect_group(self, info):
+        """The two things worth reading before letting code run: the installer
+        itself, and — when an update is waiting — what that update changes.
+        Both are the CLI's own output, loaded only if you ask for it."""
+        g = Adw.PreferencesGroup(
+            title="Before you run it",
+            description="An app's installer is the whole of what installing it does.")
+        name = self.app["name"]
+
+        e = Adw.ExpanderRow(title="Installer",
+                            subtitle=esc(info.get("installer") or "install.sh"))
+        self._lazy_text(e, [self.win.nova, "info", "--installer", name])
+        g.add(e)
+
+        if self.app["status"] == "update-available":
+            e2 = Adw.ExpanderRow(title="What this update changes",
+                                 subtitle="commits, files, and the installer's own diff")
+            self._lazy_text(e2, [self.win.nova, "diff", name])
+            g.add(e2)
+        return g
+
+    @staticmethod
+    def _lazy_text(expander, argv, empty="(nothing to show)"):
+        """Fill an expander the first time it is opened, off the UI thread.
+
+        Lazily, because running every app's installer through a subprocess just
+        to build a dialog nobody expanded would make opening one slow."""
+        buf = Gtk.TextBuffer()
+        view = Gtk.TextView(buffer=buf, editable=False, monospace=True,
+                            top_margin=8, bottom_margin=8,
+                            left_margin=8, right_margin=8)
+        view.set_wrap_mode(Pango.WrapMode.NONE)
+        scroll = Gtk.ScrolledWindow(child=view)
+        scroll.set_size_request(-1, 280)
+        expander.add_row(scroll)
+        loaded = []
+
+        def fill(text):
+            buf.set_text(text)
+            return False
+
+        def on_expanded(*_):
+            if loaded or not expander.get_expanded():
+                return
+            loaded.append(1)
+            buf.set_text("loading…")
+
+            def worker():
+                try:
+                    p = subprocess.run(argv, capture_output=True, text=True,
+                                       stdin=subprocess.DEVNULL, timeout=180)
+                    out = (p.stdout or "") + (p.stderr or "")
+                except Exception as e:  # noqa: BLE001
+                    out = str(e)
+                GLib.idle_add(fill, out.strip() or empty)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        expander.connect("notify::expanded", on_expanded)
+
+    def _load(self):
+        try:
+            out = subprocess.run([self.win.nova, "info", "--porcelain", self.app["name"]],
+                                 capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120).stdout
+        except Exception as e:  # noqa: BLE001
+            out = ""
+            GLib.idle_add(self.win.append_log, "info failed: %s\n" % e)
+        info = {}
+        for line in out.splitlines():
+            k, _, v = line.partition("=")
+            info[k] = v
+        GLib.idle_add(self._populate, info)
+
+    def _populate(self, info):
+        self.box.remove(self._placeholder)
+        rd = info.get("repo_dir", "")
+
+        icon = repo_path(rd, info.get("icon", ""))
+        if icon:
+            pic = Gtk.Image.new_from_file(icon)
+            pic.set_pixel_size(96)
+            parent = self.big_icon.get_parent()
+            parent.insert_child_after(pic, None)
+            parent.remove(self.big_icon)
+            self.big_icon = pic
+
+        shots = [repo_path(rd, p) for p in info.get("screenshots", "").split()]
+        shots = [p for p in shots if p]
+        if shots:
+            # spacing, so two screenshots stop touching; and each one opens a
+            # viewer, because a 320px-tall thumbnail of a screenshot is not
+            # something you can read
+            car = Adw.Carousel(allow_scroll_wheel=False, spacing=14)
+            car.set_size_request(-1, 320)
+            for i, p in enumerate(shots):
+                pic = Gtk.Picture.new_for_filename(p)
+                pic.set_content_fit(Gtk.ContentFit.CONTAIN)
+                pic.add_css_class("nova-shot")
+                btn = Gtk.Button(child=pic, tooltip_text="Open full size")
+                btn.add_css_class("flat")
+                btn.add_css_class("nova-shot-btn")
+                btn.connect("clicked",
+                            lambda _b, idx=i: ShotDialog(shots, idx).present(self))
+                car.append(btn)
+            self.box.append(car)
+            if len(shots) > 1:
+                self.box.append(Adw.CarouselIndicatorDots(carousel=car))
+
+        facts = Adw.PreferencesGroup(title="About")
+        got = False
+        for key, label in (("version", "Version"), ("author", "Author"),
+                           ("license", "License"), ("category", "Category")):
+            if info.get(key):
+                facts.add(Adw.ActionRow(title=label, subtitle=esc(info[key])))
+                got = True
+        if info.get("homepage"):
+            r = Adw.ActionRow(title="Homepage", subtitle=esc(info["homepage"]),
+                              activatable=True)
+            r.add_suffix(Gtk.Image(icon_name=ui_icon("adw-external-link-symbolic", "external-link", "go-jump")))
+            r.connect("activated", lambda *_: Gtk.UriLauncher(
+                uri=info["homepage"]).launch(self.win, None, None, None))
+            facts.add(r)
+            got = True
+        if got:
+            self.box.append(facts)
+
+        inst = Adw.PreferencesGroup(title="What it installs")
+        chips = component_chips(info.get("components"))
+        if chips:
+            holder = Adw.PreferencesRow(activatable=False, selectable=False)
+            chips.set_margin_top(12)
+            chips.set_margin_bottom(12)
+            chips.set_margin_start(12)
+            chips.set_margin_end(12)
+            holder.set_child(chips)
+            inst.add(holder)
+        scopes = info.get("scopes", "").split()
+        # `nova info --porcelain` has reported installed_<scope> all along; the
+        # dialog never showed it, so there was nowhere in the GUI that said
+        # which half of a dual-scope app was actually on the machine.
+        def state(sc):
+            there = info.get("installed_%s" % sc) == "1"
+            return pill("INSTALLED" if there else "NOT INSTALLED",
+                        ("ok" if sc == "user" else "root") if there else "dim")
+        if "user" in scopes:
+            r = Adw.ActionRow(
+                title="Into your home directory",
+                subtitle="~/.local — no password needed, survives a system rebase")
+            r.add_suffix(state("user"))
+            inst.add(r)
+        if "system" in scopes:
+            r = Adw.ActionRow(
+                title="Outside your home directory",
+                subtitle=esc(info.get("root_reason")
+                             or "installs files and services system-wide"))
+            r.add_prefix(Gtk.Image(icon_name=ui_icon("dialog-warning-symbolic", "dialog-warning")))
+            r.add_suffix(state("system"))
+            inst.add(r)
+        self.box.append(inst)
+
+        self.box.append(self._version_group(info))
+        self.box.append(self._inspect_group(info))
+
+        deps = info.get("depends", "").split()
+        if deps:
+            missing = set(info.get("depends_missing", "").split())
+            g = Adw.PreferencesGroup(
+                title="Needs",
+                description=("Something is missing — the installer may fail"
+                             if missing else "All present on this machine"))
+            for d in deps:
+                r = Adw.ActionRow(title=esc(d))
+                ok = d not in missing
+                img = Gtk.Image(icon_name=ui_icon("object-select-symbolic", "object-select", "emblem-ok") if ok
+                                else ui_icon("dialog-warning-symbolic", "dialog-warning"))
+                img.add_css_class("nova-dep-ok" if ok else "nova-dep-bad")
+                r.add_suffix(img)
+                g.add(r)
+            self.box.append(g)
+
+        about = repo_path(rd, info.get("about", ""))
+        if about:
+            try:
+                text = open(about, encoding="utf-8", errors="replace").read()
+            except OSError:
+                text = ""
+            if text.strip():
+                # Rendered, and behind an expander like the installer: a README
+                # is often the longest thing in the dialog, and it used to be
+                # stripped of its code blocks and tables and flattened into one
+                # dim paragraph.
+                g = Adw.PreferencesGroup(title="Read me")
+                e = Adw.ExpanderRow(title=os.path.basename(about),
+                                    subtitle="the project's own README")
+                body = markdown_widget(text)
+                body.set_margin_top(12)
+                body.set_margin_bottom(14)
+                body.set_margin_start(14)
+                body.set_margin_end(14)
+                sc = Gtk.ScrolledWindow(child=body,
+                                        hscrollbar_policy=Gtk.PolicyType.NEVER)
+                sc.set_size_request(-1, 420)
+                e.add_row(sc)
+                b = Gtk.Button(label="Open", valign=Gtk.Align.CENTER)
+                b.add_css_class("flat")
+                b.connect("clicked", lambda *_, t=text, n=os.path.basename(about):
+                          ReadmeDialog(t, n).present(self))
+                e.add_suffix(b)
+                g.add(e)
+                self.box.append(g)
+
+        src = Adw.PreferencesGroup(title="Source")
+        r = Adw.ActionRow(title="Repository", subtitle=esc(info.get("url", "")))
+        r.set_subtitle_lines(2)
+        src.add(r)
+        self.box.append(src)
+        return False
+
+
+class CatalogDialog(Adw.Dialog):
+    """Add, inspect and remove catalogs.
+
+    Catalogs are opt-in: nothing appears in the explorer until one is added.
+    That is a security property, not an oversight, so adding one says plainly
+    what it means rather than treating it as a bookmark."""
+
+    def __init__(self, win):
+        super().__init__(title="Catalogs")
+        self.set_content_width(620)
+        self.set_content_height(560)
+        self.win = win
+
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                           margin_top=18, margin_bottom=18,
+                           margin_start=18, margin_end=18)
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                      vexpand=True)
+        scroller.set_child(Adw.Clamp(child=self.box, maximum_size=580))
+        tb = Adw.ToolbarView(content=scroller)
+        tb.add_top_bar(Adw.HeaderBar())
+        self.set_child(tb)
+        self.reload()
+
+    def reload(self):
+        child = self.box.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.box.remove(child)
+            child = nxt
+
+        add = Adw.PreferencesGroup(
+            title="Add a catalog",
+            description="A catalog is a git repo listing apps. Adding one lets "
+                        "those apps run their own installers on this machine, "
+                        "and an app that declares the system scope runs its "
+                        "installer as root. Add catalogs you trust.")
+        self.entry = Adw.EntryRow(title="Catalog git URL")
+        self.entry.set_show_apply_button(True)
+        self.entry.connect("apply", lambda w: self._add(w.get_text().strip()))
+        add.add(self.entry)
+        self.box.append(add)
+
+        g = Adw.PreferencesGroup(title="Registered")
+        rows = 0
+        try:
+            out = subprocess.run([self.win.nova, "catalog", "list", "--porcelain"],
+                                 capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60).stdout
+        except Exception as e:  # noqa: BLE001
+            out = ""
+            self.win.append_log("catalog list failed: %s\n" % e)
+        for line in out.splitlines():
+            p = line.split("\t")
+            if len(p) < 2:
+                continue
+            name, url = p[0], p[1]
+            count = p[2] if len(p) > 2 else "?"
+            desc = p[3] if len(p) > 3 else ""
+            row = Adw.ActionRow(title=GLib.markup_escape_text(name))
+            row.set_subtitle(GLib.markup_escape_text(
+                "%s app(s)  ·  %s" % (count, desc or url)))
+            row.set_subtitle_lines(2)
+            rm = Gtk.Button(icon_name=ui_icon("user-trash-symbolic", "user-trash"),
+                            valign=Gtk.Align.CENTER,
+                            tooltip_text="Remove this catalog")
+            rm.add_css_class("flat")
+            rm.add_css_class("error")
+            rm.connect("clicked", lambda _b, u=url, n=name: self._remove(u, n))
+            row.add_suffix(rm)
+            g.add(row)
+            rows += 1
+        if not rows:
+            g.add(Adw.ActionRow(
+                title="No catalogs yet",
+                subtitle="Nothing is listed until you add one"))
+        self.box.append(g)
+
+    def _add(self, url):
+        if not url:
+            return
+        self.entry.set_text("")
+        self.win.run_catalog(["catalog", "add", url], self)
+
+    def _remove(self, url, name):
+        dlg = Adw.AlertDialog(
+            heading="Remove %s?" % name,
+            body="Its apps disappear from the list. Anything already installed "
+                 "stays until you uninstall it.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("remove", "Remove")
+        dlg.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.connect("response", lambda _d, r: r == "remove"
+                    and self.win.run_catalog(["catalog", "remove", url], self))
+        dlg.present(self)
+
+
+class DoctorDialog(Adw.Dialog):
+    """`nova doctor`, shown rather than buried in the log pane.
+
+    Every condition it checks is one that used to be invisible until it bit
+    someone — a stale lock, a root copy frozen releases back, a list root
+    silently ignores, a timer that never got enabled. That is worth a window
+    you can read, not a toast."""
+
+    def __init__(self, win):
+        super().__init__(title="Check this install")
+        self.nova = win.nova
+        self.set_content_width(680)
+        self.set_content_height(620)
+
+        self.buf = Gtk.TextBuffer()
+        view = Gtk.TextView(buffer=self.buf, editable=False, monospace=True,
+                            top_margin=10, bottom_margin=10,
+                            left_margin=10, right_margin=10)
+        view.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        scroll = Gtk.ScrolledWindow(child=view, vexpand=True)
+
+        self.banner = Adw.StatusPage(
+            icon_name=ui_icon("content-loading-symbolic", "content-loading"),
+            title="Checking…")
+        self.stack = Gtk.Stack()
+        self.stack.add_named(self.banner, "busy")
+        self.stack.add_named(scroll, "out")
+
+        tb = Adw.ToolbarView(content=self.stack)
+        header = Adw.HeaderBar()
+        self.again = Gtk.Button(label="Check again")
+        self.again.connect("clicked", lambda *_: self.run())
+        header.pack_end(self.again)
+        tb.add_top_bar(header)
+        self.set_child(tb)
+        self.run()
+
+    def run(self):
+        self.stack.set_visible_child_name("busy")
+        self.again.set_sensitive(False)
+
+        def worker():
+            try:
+                p = subprocess.run([self.nova, "doctor"],
+                                   capture_output=True, text=True,
+                                   stdin=subprocess.DEVNULL, timeout=300)
+                out, rc = (p.stdout or "") + (p.stderr or ""), p.returncode
+            except Exception as e:  # noqa: BLE001
+                out, rc = str(e), 1
+            GLib.idle_add(self._done, out, rc)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _done(self, out, rc):
+        self.buf.set_text(out.strip() or "(no output)")
+        self.stack.set_visible_child_name("out")
+        self.again.set_sensitive(True)
+        self.set_title("Check this install — %s" %
+                       ("all clear" if rc == 0 else "needs attention"))
+        return False
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, nova):
+        super().__init__(application=app, title="Nova Apps")
+        self.set_icon_name(APP_ID)
+        self.nova = nova
+        self.busy = False
+        self._pulse = None
+        self.set_default_size(980, 800)
+        self.set_size_request(360, 420)
+        self.narrow = False
+
+        self.store = Gio.ListStore(item_type=App)
+        self.filtered = Gtk.FilterListModel(
+            model=self.store, filter=Gtk.CustomFilter.new(self._match))
+        self.sorted = Gtk.SortListModel(
+            model=self.filtered, sorter=Gtk.CustomSorter.new(self._compare))
+
+        header = Adw.HeaderBar()
+        self.title = Adw.WindowTitle(title="Nova Apps", subtitle="")
+        header.set_title_widget(self.title)
+        self.btn_refresh = Gtk.Button(icon_name=ui_icon("view-refresh-symbolic", "view-refresh"),
+                                      tooltip_text="Refresh and check for updates")
+        self.btn_refresh.connect("clicked", lambda *_: self.refresh())
+        header.pack_start(self.btn_refresh)
+        self.btn_updateall = Gtk.Button(label="Update All")
+        self.btn_updateall.add_css_class("suggested-action")
+        self.btn_updateall.set_visible(False)
+        self.btn_updateall.connect("clicked", self._on_update_all)
+        header.pack_end(self.btn_updateall)
+        self.btn_catalogs = Gtk.Button(
+            icon_name=ui_icon("folder-remote-symbolic", "folder-remote",
+                              "application-rss+xml"),
+            tooltip_text="Catalogs — where apps come from")
+        self.btn_catalogs.connect("clicked",
+                                  lambda *_: CatalogDialog(self).present(self))
+        header.pack_start(self.btn_catalogs)
+
+        self.btn_log = Gtk.ToggleButton(icon_name=ui_icon("utilities-terminal-symbolic", "utilities-terminal"),
+                                        tooltip_text="Show output")
+        header.pack_end(self.btn_log)
+        self.btn_doctor = Gtk.Button(
+            icon_name=ui_icon("emblem-ok-symbolic", "dialog-information-symbolic",
+                              "dialog-information"),
+            tooltip_text="Check this install — locks, versions, timers, list files")
+        self.btn_doctor.connect("clicked", lambda *_: self._open_doctor())
+        header.pack_start(self.btn_doctor)
+
+        self.search = Gtk.SearchEntry(placeholder_text="Search apps…", hexpand=True)
+        self.search.connect("search-changed", lambda *_: self._refilter())
+        sbar = Gtk.SearchBar(search_mode_enabled=True, show_close_button=False)
+        self.clamp_search = Adw.Clamp(child=self.search, maximum_size=780)
+        sbar.set_child(self.clamp_search)
+        sbar.connect_entry(self.search)
+
+        self.f_status = Gtk.DropDown.new_from_strings(
+            ["All apps", "Installed", "Updates", "Not installed"])
+        self.f_status.connect("notify::selected", lambda *_: self._refilter())
+        self.f_sort = Gtk.DropDown.new_from_strings(["Name", "Status", "Category"])
+        self.f_sort.set_selected(1)
+        self.f_sort.connect("notify::selected", lambda *_: self._resort())
+
+        filters = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                          margin_start=12, margin_end=12, margin_bottom=8)
+        filters.append(self.f_status)
+        filters.append(Gtk.Box(hexpand=True))
+        self.sort_label = Gtk.Label(label="Sort")
+        self.sort_label.add_css_class("dim-label")
+        filters.append(self.sort_label)
+        filters.append(self.f_sort)
+
+        # Category chips rather than a dropdown: with dozens of tools the
+        # categories ARE the navigation, and a chip row shows what exists
+        # instead of hiding it behind a click.
+        if hasattr(Adw, "WrapBox"):
+            # packs chips at their natural width and wraps; FlowBox would force
+            # equal-width columns and waste half the row
+            self.chipbox = Adw.WrapBox(child_spacing=6, line_spacing=6,
+                                       margin_start=12, margin_end=12,
+                                       margin_bottom=10)
+        else:
+            self.chipbox = Gtk.FlowBox(
+                selection_mode=Gtk.SelectionMode.NONE, homogeneous=False,
+                row_spacing=6, column_spacing=6, min_children_per_line=1,
+                max_children_per_line=12, margin_start=12, margin_end=12,
+                margin_bottom=10)
+        self.category = ""
+        self._chips = []
+
+        # ---- hero ----
+        self.hero_icon = Gtk.Image(icon_name=ui_icon("view-grid-symbolic", "view-grid", "applications-other"), pixel_size=32)
+        self.hero_icon.add_css_class("nova-hero-icon")
+        self.hero_text = Gtk.Label(xalign=0, label="")
+        self.hero_text.add_css_class("title-2")
+        self.hero_sub = Gtk.Label(xalign=0, label="")
+        self.hero_sub.add_css_class("nova-hero-lbl")
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True,
+                      valign=Gtk.Align.CENTER)
+        col.append(self.hero_text)
+        col.append(self.hero_sub)
+        self.hero_btn = Gtk.Button(label="Update All", valign=Gtk.Align.CENTER)
+        self.hero_btn.add_css_class("suggested-action")
+        self.hero_btn.add_css_class("pill")
+        self.hero_btn.set_visible(False)
+        self.hero_btn.connect("clicked", self._on_update_all)
+        self.hero = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        self.hero.add_css_class("nova-hero")
+        self.hero.append(self.hero_icon)
+        self.hero.append(col)
+        self.hero.append(self.hero_btn)
+
+        self.gridbox = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
+            min_children_per_line=1, max_children_per_line=8,
+            row_spacing=12, column_spacing=12, valign=Gtk.Align.START)
+        self.gridbox.bind_model(self.sorted, self._make_card)
+        self.gridbox.connect("child-activated",
+                             lambda _fb, ch: self._open(ch.get_child().app))
+
+        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.listbox.add_css_class("boxed-list")
+        self.listbox.bind_model(self.sorted, self._make_row)
+        self.listbox.connect("row-activated", self._on_row_activated)
+        self.listbox.set_header_func(self._header)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                        margin_top=14, margin_bottom=18,
+                        margin_start=12, margin_end=12)
+        inner.append(self.hero)
+        self.viewstack = Gtk.Stack()
+        self.viewstack.add_named(self.listbox, "rows")
+        self.viewstack.add_named(self.gridbox, "grid")
+        inner.append(self.viewstack)
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                      vexpand=True)
+        # The grid wants room to add columns; the list wants a readable column.
+        self.clamp = Adw.Clamp(child=inner, maximum_size=1800)
+        scroller.set_child(self.clamp)
+
+        self.stack = Gtk.Stack()
+        self.stack.add_named(scroller, "list")
+        self.stack.add_named(Adw.StatusPage(
+            icon_name=ui_icon("system-search-symbolic", "system-search", "edit-find"), title="Nothing matches",
+            description="Try a different search, or clear the filters"), "empty")
+        empty = Adw.StatusPage(
+            icon_name=ui_icon("folder-download-symbolic", "folder-download"),
+            title="No apps yet",
+            description="Catalogs are opt-in — nothing shows up until you add one.")
+        empty_btn = Gtk.Button(label="Add a Catalog", halign=Gtk.Align.CENTER)
+        empty_btn.add_css_class("suggested-action")
+        empty_btn.add_css_class("pill")
+        empty_btn.connect("clicked", lambda *_: CatalogDialog(self).present(self))
+        empty.set_child(empty_btn)
+        self.stack.add_named(empty, "none")
+
+        self.logbuf = Gtk.TextBuffer()
+        self.logview = Gtk.TextView(buffer=self.logbuf, editable=False,
+                                    monospace=True, top_margin=6, left_margin=6)
+        logscroll = Gtk.ScrolledWindow(child=self.logview)
+        logscroll.set_size_request(-1, 190)
+        self.logrev = Gtk.Revealer(child=logscroll,
+                                   transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
+        self.btn_log.bind_property("active", self.logrev, "reveal-child",
+                                   GObject.BindingFlags.BIDIRECTIONAL)
+
+        self.progress = Gtk.ProgressBar(visible=False)
+        self.toasts = Adw.ToastOverlay()
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        body.append(self.progress)
+        body.append(self.stack)
+        body.append(self.logrev)
+        self.toasts.set_child(body)
+
+        tb = Adw.ToolbarView(content=self.toasts)
+        tb.add_top_bar(header)
+        tb.add_top_bar(sbar)
+        self.clamp_filters = Adw.Clamp(child=filters, maximum_size=780)
+        self.clamp_chips = Adw.Clamp(child=self.chipbox, maximum_size=780)
+        tb.add_top_bar(self.clamp_filters)
+        tb.add_top_bar(self.clamp_chips)
+        self.set_content(tb)
+
+        # Below this width the row decorations stop helping and start hiding the
+        # name, so they go away and the row keeps only what it needs.
+        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 720px"))
+        bp.connect("apply", lambda *_: self._set_narrow(True))
+        bp.connect("unapply", lambda *_: self._set_narrow(False))
+        self.add_breakpoint(bp)
+
+        self.refresh()
+
+    def _set_narrow(self, narrow):
+        self.narrow = narrow
+        self.sort_label.set_visible(not narrow)
+        self.viewstack.set_visible_child_name("rows" if narrow else "grid")
+        # the toolbar has to sit in the same column as the content, or the
+        # search box floats in the middle of a three-column grid
+        width = 780 if narrow else 1800
+        for c in (self.clamp, self.clamp_search, self.clamp_filters,
+                  self.clamp_chips):
+            c.set_maximum_size(width)
+        child = self.listbox.get_first_child()
+        while child:
+            for w in getattr(child, "optional", ()):
+                w.set_visible(not narrow)
+            child = child.get_next_sibling()
+
+    def _all(self):
+        return [self.store.get_item(i) for i in range(self.store.get_n_items())]
+
+    def _on_update_all(self, *_):
+        self.run_action("update", [a["name"] for a in self._all()
+                                   if a["status"] == "update-available"])
+
+    def _match(self, app, *_):
+        term = self.search.get_text().strip().lower()
+        if term and term not in app.haystack():
+            return False
+        sel = self.f_status.get_selected()
+        if sel == 1 and not app.is_installed:
+            return False
+        if sel == 2 and app["status"] != "update-available":
+            return False
+        if sel == 3 and app.is_installed:
+            return False
+        if self.category and app["category"] != self.category:
+            return False
+        return True
+
+    def _compare(self, a, b, *_):
+        mode = self.f_sort.get_selected()
+        if mode == 1:
+            order = {"update-available": 0, "partial": 1, "installed": 2,
+                     "not-installed": 3, "unreachable": 4}
+            ka = (order.get(a["status"], 9), a["name"].lower())
+            kb = (order.get(b["status"], 9), b["name"].lower())
+        elif mode == 2:
+            ka = (a["category"].lower() or "zzz", a["name"].lower())
+            kb = (b["category"].lower() or "zzz", b["name"].lower())
+        else:
+            ka, kb = (a["name"].lower(),), (b["name"].lower(),)
+        return -1 if ka < kb else (1 if ka > kb else 0)
+
+    def _refilter(self):
+        self.filtered.get_filter().changed(Gtk.FilterChange.DIFFERENT)
+        self._update_empty()
+        GLib.idle_add(self._set_narrow, self.narrow)
+
+    def _resort(self):
+        self.sorted.get_sorter().changed(Gtk.SorterChange.DIFFERENT)
+        self.listbox.invalidate_headers()
+
+    def _update_empty(self):
+        if self.store.get_n_items() == 0:
+            self.stack.set_visible_child_name("none")
+        else:
+            self.stack.set_visible_child_name(
+                "list" if self.sorted.get_n_items() else "empty")
+
+    # ------------------------------------------------------------------
+    # The app drawer.
+    #
+    # One presentation, not two. An earlier version grew a bespoke card grid
+    # for wide windows and hand-built rows for narrow ones; both had to
+    # re-implement spacing, ellipsizing and alignment that Adw.ActionRow
+    # already gets right, and they drifted apart at every size. A single
+    # boxed list inside a clamp is what GNOME itself does: it fills a narrow
+    # window and centres in a wide one, so there is nothing to tune per size.
+    # ------------------------------------------------------------------
+    def _action_button(self, app, compact=False):
+        """The one thing you can do to this app right now."""
+        st = app["status"]
+        btn = Gtk.Button(valign=Gtk.Align.CENTER, halign=Gtk.Align.END)
+        if st == "update-available":
+            btn.set_label("Update")
+            btn.add_css_class("suggested-action")
+            btn.connect("clicked", lambda *_: self.run_action("update", [app["name"]]))
+        elif st == "partial":
+            btn.set_label("Complete")
+            btn.add_css_class("suggested-action")
+            btn.connect("clicked", lambda *_: self.run_action("install", [app["name"]]))
+        elif st in ("not-installed", "unreachable"):
+            btn.set_label("Install")
+            btn.connect("clicked", lambda *_: self.run_action("install", [app["name"]]))
+        else:
+            if compact:
+                btn.set_label("Details")
+            else:
+                btn.set_icon_name(ui_icon("go-next-symbolic", "go-next"))
+            btn.add_css_class("flat")
+            btn.connect("clicked", lambda *_: self._open(app))
+        return btn
+
+    # A card is a fixed-width tile; the grid decides how many fit. Height comes
+    # from the content, but every card has the same structure — icon line, two
+    # lines of description, footer — so they line up without a hard-coded height
+    # and without leaving dead space in the short ones.
+    CARD_WIDTH = 290
+
+    def _make_card(self, app):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                       width_request=self.CARD_WIDTH)
+        card.add_css_class("nova-card")
+        card.app = app
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        head.append(tile(app))
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1,
+                       hexpand=True, halign=Gtk.Align.FILL,
+                       valign=Gtk.Align.CENTER)
+        text.append(self._text(app["name"], css="nova-card-title"))
+        text.append(self._text(app["category"] or app["comp"], css="nova-card-desc"))
+        head.append(text)
+        card.append(head)
+
+        desc = self._text(app["desc"], css="nova-card-desc", wrap=True, lines=2)
+        desc.set_vexpand(True)
+        desc.set_valign(Gtk.Align.START)
+        card.append(desc)
+
+        foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        badges = self._badges(app)
+        badges.set_hexpand(True)
+        foot.append(badges)
+        foot.append(self._action_button(app, compact=True))
+        card.append(foot)
+        return card
+
+    @staticmethod
+    def _text(text, css=None, wrap=False, lines=-1):
+        lbl = Gtk.Label(label=text or "", xalign=0.0,
+                        halign=Gtk.Align.START, hexpand=True,
+                        ellipsize=Pango.EllipsizeMode.END)
+        if wrap:
+            lbl.set_wrap(True)
+            lbl.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            lbl.set_lines(lines)
+        if css:
+            lbl.add_css_class(css)
+        return lbl
+
+    @staticmethod
+    def _badges(app):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                      halign=Gtk.Align.START, valign=Gtk.Align.CENTER)
+        for p in scope_pills(app):
+            box.append(p)
+        label, kind = STATUS.get(app["status"], ("", "dim"))
+        if label:
+            box.append(pill(label.upper(), kind))
+        if app["pinned"]:
+            box.append(pill("PINNED", "warn", "held at %s" % app["pinned"]))
+        return box
+
+    def _make_row(self, app):
+        row = Adw.ActionRow(title=GLib.markup_escape_text(app["name"]),
+                            activatable=True)
+        row.set_subtitle(GLib.markup_escape_text(app["desc"] or app["comp"]))
+        row.set_subtitle_lines(1)
+        row.app = app
+        row.add_prefix(tile(app))
+
+        row.optional = []
+        for p in scope_pills(app):
+            row.add_suffix(p)
+            row.optional.append(p)
+        if app["pinned"]:
+            p = pill("PINNED", "warn", "held at %s" % app["pinned"])
+            row.add_suffix(p)
+            row.optional.append(p)
+        label, kind = STATUS.get(app["status"], ("", "dim"))
+        if label:
+            p = pill(label.upper(), kind)
+            row.add_suffix(p)
+            row.optional.append(p)
+        ver = Gtk.Label(label=app["ver"], valign=Gtk.Align.CENTER)
+        ver.add_css_class("numeric")
+        ver.add_css_class("dim-label")
+        row.add_suffix(ver)
+        row.optional.append(ver)
+
+        row.add_suffix(self._action_button(app))
+        for w in row.optional:
+            w.set_visible(not self.narrow)
+        return row
+
+    SECTION = {"update-available": "Updates", "partial": "Finish installing",
+               "installed": "Installed", "not-installed": "Discover",
+               "unreachable": "Unreachable"}
+
+    def _header(self, row, before):
+        """Group the list so it reads as sections rather than one long scroll."""
+        mode = self.f_sort.get_selected()
+        if mode == 1:
+            key = self.SECTION.get(row.app["status"], "Other")
+            prev = self.SECTION.get(before.app["status"], "Other") if before else None
+        elif mode == 2:
+            key = row.app["category"] or "Uncategorised"
+            prev = (before.app["category"] or "Uncategorised") if before else None
+        else:
+            row.set_header(None)
+            return
+        if key != prev:
+            lbl = Gtk.Label(label=key.upper(), xalign=0)
+            lbl.add_css_class("nova-section")
+            row.set_header(lbl)
+        else:
+            row.set_header(None)
+
+    def _resort_headers(self):
+        self.listbox.invalidate_headers()
+
+    def _on_row_activated(self, _lb, row):
+        self._open(row.app)
+
+    def _open(self, app):
+        DetailDialog(self, app).present(self)
+
+    def _open_doctor(self):
+        DoctorDialog(self).present(self)
+
+    def refresh(self):
+        if self.busy:
+            return
+        self.set_busy(True, "Checking for updates…")
+
+        def worker():
+            try:
+                out = subprocess.run([self.nova, "list", "--porcelain", "--check"],
+                                     capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600).stdout
+            except Exception as e:  # noqa: BLE001
+                out = ""
+                GLib.idle_add(self.append_log, "refresh failed: %s\n" % e)
+            GLib.idle_add(self.populate, out)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def populate(self, porcelain):
+        self.store.remove_all()
+        cats, updates = set(), 0
+        for line in porcelain.splitlines():
+            p = line.split("\t")
+            if len(p) < 7:
+                continue
+            d = dict(name=p[0], scopes=p[1], comp=p[2], status=p[3], ver=p[4],
+                     url=p[5], desc=p[6],
+                     tref=p[7] if len(p) > 7 else "",
+                     category=p[8] if len(p) > 8 else "",
+                     tags=p[9] if len(p) > 9 else "",
+                     repo_dir=p[10] if len(p) > 10 else "",
+                     root_reason=p[11] if len(p) > 11 else "",
+                     installed_scopes=p[12] if len(p) > 12 else "",
+                     pinned=p[13] if len(p) > 13 else "")
+            if d["status"] == "update-available":
+                updates += 1
+            if d["category"]:
+                cats.add(d["category"])
+            self.store.append(App(d))
+
+        self._build_chips(sorted(cats))
+
+        n = self.store.get_n_items()
+        inst = sum(1 for a in self._all() if a.is_installed)
+        self.btn_updateall.set_visible(updates > 0)
+        self.hero_btn.set_visible(updates > 0)
+        if updates:
+            self.hero.remove_css_class("plain")
+            self.hero_icon.set_from_icon_name(ui_icon("software-update-available-symbolic", "software-update-available", "system-software-update"))
+            self.hero_text.set_label(
+                "%d update%s ready" % (updates, "" if updates == 1 else "s"))
+        else:
+            self.hero.add_css_class("plain")
+            self.hero_icon.set_from_icon_name(ui_icon("view-grid-symbolic", "view-grid", "applications-other"))
+            self.hero_text.set_label("Everything is up to date")
+        self.hero_sub.set_label(
+            "%d app%s available · %d installed" % (n, "" if n == 1 else "s", inst))
+        self.set_busy(False, "")
+        self.title.set_subtitle("%d app%s" % (n, "" if n == 1 else "s"))
+        self._refilter()
+        self._set_narrow(self.narrow)
+        return False
+
+    def _build_chips(self, cats):
+        for c in self._chips:
+            parent = c.get_parent()          # FlowBox wraps each child; WrapBox does not
+            self.chipbox.remove(parent if isinstance(parent, Gtk.FlowBoxChild) else c)
+        self._chips = []
+        counts = {}
+        for a in self._all():
+            counts[a["category"]] = counts.get(a["category"], 0) + 1
+        first = None
+        for label, value in [("All", "")] + [(c, c) for c in cats]:
+            n = len(self._all()) if value == "" else counts.get(value, 0)
+            btn = Gtk.ToggleButton(label="%s  %d" % (label, n))
+            btn.add_css_class("nova-chip")
+            if first is None:
+                first = btn
+            else:
+                btn.set_group(first)
+            btn.set_active(value == self.category)
+            btn.connect("toggled", self._on_chip, value)
+            self.chipbox.append(btn)
+            self._chips.append(btn)
+
+    def _on_chip(self, btn, value):
+        if btn.get_active() and self.category != value:
+            self.category = value
+            self._refilter()
+
+    def _confirm_root(self, verb, names, root_apps):
+        """Installing an app that declares the system scope runs its installer
+        as root. Say that, and say why, while it is still a decision — not at
+        the password prompt, by which point the choice has been made."""
+        parts = []
+        for a in root_apps:
+            parts.append("<b>%s</b>\n%s" % (
+                esc(a["name"]),
+                esc(a["root_reason"]
+                    or "installs files and services outside your home directory")))
+        dlg = Adw.AlertDialog(
+            heading="Install with root access?",
+            body="\n\n".join(parts) + "\n\nYou will be asked to authenticate.")
+        dlg.set_body_use_markup(True)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("install", "Install")
+        dlg.set_response_appearance("install", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: r == "install"
+                    and self.run_action(verb, names, confirmed=True))
+        dlg.present(self)
+
+    def _confirm_uninstall(self, names):
+        """Removing a catalog asks first; removing an actual app did not —
+        one click on a button next to the one you meant and the uninstaller
+        had already run."""
+        dlg = Adw.AlertDialog(
+            heading="Uninstall %s?" % (esc(names[0]) if len(names) == 1
+                                       else "%d apps" % len(names)),
+            body="Its own uninstaller removes its files. Configuration is "
+                 "kept, so reinstalling later picks up where you left off.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("remove", "Uninstall")
+        dlg.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: r == "remove"
+                    and self.run_action("uninstall", names, confirmed=True))
+        dlg.present(self)
+
+    def run_action(self, verb, names, confirmed=False):
+        if self.busy or not names:
+            return
+        if verb == "uninstall" and not confirmed:
+            self._confirm_uninstall(names)
+            return
+        if verb == "install" and not confirmed:
+            wanted = set(names)
+            root_apps = [a for a in self._all()
+                         if a["name"] in wanted and a.needs_root]
+            if root_apps:
+                self._confirm_root(verb, names, root_apps)
+                return
+        self.set_busy(True, "%s %d app(s)…" % (verb.capitalize(), len(names)))
+        self._spawn([self.nova, verb] + list(names),
+                    lambda rc: self.after_action(rc, verb))
+
+    def run_catalog(self, args, dialog):
+        """Catalog changes alter where every app comes from, so the whole
+        listing is rebuilt afterwards."""
+        self._spawn([self.nova] + list(args),
+                    lambda rc: self._after_catalog(rc, dialog))
+
+    def run_cli(self, args):
+        """Any other state-changing CLI call — pin, unpin — same treatment."""
+        self._spawn([self.nova] + list(args), self._after_cli)
+
+    def _spawn(self, cmd, done):
+        """Run a nova command, streaming its output into the log pane.
+
+        One copy of this. There used to be three, and they had already drifted:
+        only one closed stdin, so depending on which button you pressed, nova's
+        as_root saw a tty, chose sudo, and prompted for a password in whatever
+        terminal nova-gui was launched from while the window sat there looking
+        hung. With no stdin it uses pkexec, which has a dialog."""
+        self.btn_log.set_active(True)
+
+        def worker():
+            GLib.idle_add(self.append_log,
+                          "\n$ %s\n" % " ".join(shlex.quote(c) for c in cmd))
+            rc = 1
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True,
+                                        stdin=subprocess.DEVNULL)
+                for line in proc.stdout:
+                    GLib.idle_add(self.append_log, line)
+                rc = proc.wait()
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self.append_log, "%s\n" % e)
+            GLib.idle_add(done, rc)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_cli(self, rc):
+        self.toast("Done" if rc == 0 else "Failed — see the output")
+        self.refresh()
+        return False
+
+    def _after_catalog(self, rc, dialog):
+        self.toast("Catalogs updated" if rc == 0 else "Catalog change failed")
+        if dialog is not None:
+            dialog.reload()
+        self.refresh()
+        return False
+
+    def after_action(self, rc, verb):
+        self.set_busy(False, "")
+        self.toast("%s finished" % verb.capitalize() if rc == 0
+                   else "%s failed — see the output" % verb.capitalize())
+        self.refresh()
+        return False
+
+    def set_busy(self, busy, msg):
+        self.busy = busy
+        self.progress.set_visible(busy)
+        if busy and self._pulse is None:
+            self._pulse = GLib.timeout_add(120, self._do_pulse)
+        elif not busy and self._pulse is not None:
+            GLib.source_remove(self._pulse)
+            self._pulse = None
+        for w in (self.btn_refresh, self.btn_updateall):
+            w.set_sensitive(not busy)
+        if msg:
+            self.title.set_subtitle(msg)
+
+    def _do_pulse(self):
+        self.progress.pulse()
+        if not self.busy:
+            self._pulse = None
+            return False
+        return True
+
+    def append_log(self, text):
+        self.logbuf.insert(self.logbuf.get_end_iter(), text)
+        mark = self.logbuf.create_mark(None, self.logbuf.get_end_iter(), False)
+        self.logview.scroll_mark_onscreen(mark)
+        self.logbuf.delete_mark(mark)
+        return False
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast.new(text))
+
+
+class Application(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        win = self.get_active_window()
+        if not win:
+            nova = find_nova()
+            if not nova:
+                dlg = Adw.AlertDialog(
+                    heading="nova not found",
+                    body="Install it first:\ncurl -fsSL https://raw.githubusercontent.com/"
+                         "derlocke-ng/nova-updater/main/get-nova.sh | bash")
+                dlg.add_response("close", "Close")
+                tmp = Adw.ApplicationWindow(application=self)
+                dlg.connect("response", lambda *_: self.quit())
+                dlg.present(tmp)
+                return
+            win = Window(self, nova)
+        win.present()
+
+
+if __name__ == "__main__":
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    sys.exit(Application().run(None))

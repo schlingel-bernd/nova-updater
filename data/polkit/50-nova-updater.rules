@@ -1,0 +1,36 @@
+// nova-updater: let active admin users run the fixed-purpose system-update
+// wrapper without a password.
+//
+// pkexec of exactly one root-owned program is authorized:
+// /usr/local/libexec/nova-system-update. It accepts app NAMES, but treats them
+// as a SELECTION rather than as input — each name must match
+// ^[A-Za-z0-9][A-Za-z0-9._-]*$ (so it can never look like an option) and must
+// already appear in the root-owned system list, and the wrapper then calls
+// `nova update --system --quiet -- <names>`. The worst a caller can ask for is
+// an update of an app the administrator has already chosen to trust; with no
+// names it updates all of them, which is what the background timer wants.
+//
+// Passwordless is safe only because that program is root-owned and not
+// user-writable, and because what reaches root is a validated selection from a
+// root-owned list rather than anything the caller supplied. Installs and
+// uninstalls still require full authentication.
+//
+// pkexec canonicalizes the program path. On Silverblue/Bluefin /usr/local is a
+// symlink to /var/usrlocal, so polkit sees /var/usrlocal/libexec/... — match
+// both so the rule fires on ostree and on normal Fedora. subject.local is
+// deliberately NOT required: VM and remote desktop sessions may report
+// non-local, and active + wheel is the intended audience.
+// Verified: polkit grants this to a wheel user's systemd --user service as well
+// (subject.active holds for it on Fedora/Bluefin), which is what lets the USER
+// update timer reach the system halves. There is no root timer.
+polkit.addRule(function(action, subject) {
+    if (!(subject.isInGroup("wheel") && subject.active))
+        return;
+    if (action.id == "org.freedesktop.policykit.exec") {
+        var p = action.lookup("program");
+        if (p == "/usr/local/libexec/nova-system-update" ||
+            p == "/var/usrlocal/libexec/nova-system-update") {
+            return polkit.Result.YES;
+        }
+    }
+});

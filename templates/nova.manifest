@@ -1,0 +1,78 @@
+# nova.manifest — copy this into the root of every app repo.
+#
+# This file is the whole convention. `nova` reads nothing else to decide what
+# your app is, what it installs, or how it shows up in the app explorer.
+#
+# ---- identity -------------------------------------------------------------
+# NAME         what you type in `nova install <name>`
+# DESCRIPTION  ONE line. It is the subtitle in the explorer and what `nova
+#              search` matches against, so lead with what the thing does.
+# VERSION      your version string; keep it in sync with your git tag.
+#              nova installs the latest tag matching ^v?[0-9]+(\.[0-9]+){0,3}$
+#              — v1.2.3 counts, v2.0.0-rc1 and nightly do not, so a
+#              pre-release never overtakes a release. No version tag at all
+#              means your default branch is followed.
+# AUTHOR       who maintains it (shown in the detail view)
+# HOMEPAGE     project page
+# LICENSE      SPDX identifier, e.g. GPL-3.0-or-later
+#
+# ---- what it is -----------------------------------------------------------
+# COMPONENTS   what this app actually installs, space separated. Free-form;
+#              list what is really there rather than squeezing it into a
+#              category. Recognised for icons and headless handling:
+#                 cli  gui  daemon  service  gnome-extension  config
+#              Anything containing "gui" is skipped on a machine with no GTK
+#              stack, or with --cli-only.
+#
+# CATEGORY     ONE word, used to group and filter in the explorer and to pick
+#              the icon. Use an existing one where it fits:
+#                 Security  Network  Media  Development  Office  Files
+#                 Desktop   System
+#              Anything else still works — it just gets a generic icon.
+# TAGS         space separated extra search terms, e.g. "vpn firewall privacy"
+#
+# ---- privilege ------------------------------------------------------------
+# SCOPES       which privilege scopes this app needs, space separated:
+#                 user    installs into ~/.local — no root, survives a rebase
+#                 system  installs into /usr/local, /etc, system systemd units
+#              Declare BOTH if your app has a root service and a desktop part;
+#              nova installs each half correctly and the catalog still lists
+#              you once. Defaults to `user`.
+# ROOT_REASON  required in spirit whenever SCOPES includes `system`: one plain
+#              sentence, shown to the user BEFORE nova asks for their password.
+#
+# ---- presentation (optional, but this is what makes a listing look alive) --
+# ICON         repo-relative path to a PNG/SVG, e.g. data/icon.png. Falls back
+#              to a category icon from the user's theme.
+# SCREENSHOTS  space separated repo-relative image paths, shown in the detail
+#              view. They are read from your clone — nothing is fetched from
+#              the network.
+# ABOUT        repo-relative file shown as the long description
+#              (default: README.md)
+#
+# ---- requirements ---------------------------------------------------------
+# DEPENDS      space separated commands your installer needs. nova checks each
+#              with `command -v` and shows what is missing before installing.
+#
+# INSTALLER    installer script relative to repo root (default: install.sh)
+
+NAME=my-tool
+DESCRIPTION=Short description of my tool
+VERSION=0.1.0
+AUTHOR=
+HOMEPAGE=
+LICENSE=GPL-3.0-or-later
+
+COMPONENTS=cli
+CATEGORY=System
+TAGS=
+
+SCOPES=user
+# ROOT_REASON=installs a systemd service and a config file in /etc
+
+# ICON=data/icon.png
+# SCREENSHOTS=data/screenshots/1.png data/screenshots/2.png
+# ABOUT=README.md
+# DEPENDS=git curl
+
+INSTALLER=install.sh
