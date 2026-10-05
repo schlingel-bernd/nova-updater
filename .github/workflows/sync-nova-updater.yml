@@ -53,6 +53,7 @@ jobs:
                   return
               original = text
               replacements = [
+                  ("derlocke-ng", "schlingel-bernd"),
                   ("kiwi-updater", "nova-updater"),
                   ("kiwi_updater", "nova_updater"),
                   ("kiwi-gui", "nova-gui"),
@@ -63,10 +64,6 @@ jobs:
                   ("kiwi", "nova"),
                   ("Kiwi", "Nova"),
                   ("KIWI", "NOVA"),
-                  ("derlocke-ng/kiwi-updater", "schlingel-bernd/nova-updater"),
-                  ("https://github.com/derlocke-ng/kiwi-updater", "https://github.com/schlingel-bernd/nova-updater"),
-                  ("https://raw.githubusercontent.com/derlocke-ng/kiwi-updater", "https://raw.githubusercontent.com/schlingel-bernd/nova-updater"),
-                  ("github.com/derlocke-ng/kiwi-updater", "github.com/schlingel-bernd/nova-updater"),
               ]
               for a, b in replacements:
                   text = text.replace(a, b)
