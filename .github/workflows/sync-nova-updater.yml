@@ -36,12 +36,12 @@ jobs:
           python3 - <<'PY'
           import os
           import re
+          import shutil
           from pathlib import Path
 
           src = Path("/tmp/kiwi-updater")
           dst = Path("/tmp/nova-updater")
           if dst.exists():
-              import shutil
               shutil.rmtree(dst)
           shutil.copytree(src, dst)
 
