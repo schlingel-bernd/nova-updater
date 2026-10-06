@@ -1,0 +1,2434 @@
+#!/usr/bin/env bash
+# nova — git-based installer/updater for Nova Network tools on Fedora Silverblue
+# maintained by the Nova Network
+#
+# Apps are plain git repos containing a `nova.manifest` and an installer
+# script (default: install.sh) that supports: install | update | uninstall
+#
+# Scopes:
+#   user   — listed in ~/.config/nova-updater/apps.list, repos in ~/.local/share
+#   system — listed in /etc/nova-updater/apps.list,      repos in /var/lib
+set -euo pipefail
+
+NOVA_VERSION=2.1.1
+
+# systemd system services start without $HOME (set -u would abort at the
+# path definitions below) — root's user-scope paths are never used anyway
+export HOME="${HOME:-/root}"
+
+# root-owned copy used for system-scope work (installed by 'install.sh --with-system');
+# escalating to it instead of this script means root never executes a user-writable file
+ROOT_NOVA="/usr/local/bin/nova"
+
+# NEVER returns $SELF. Running ~/.local/bin/nova as root would hand every
+# process running as you a path to root on the next privileged call, which is
+# the entire reason the root copy exists. If it is missing we offer to install
+# it properly instead of quietly doing the unsafe thing.
+root_nova() {
+    if [[ -x $ROOT_NOVA ]]; then
+        echo "$ROOT_NOVA"; return 0
+    fi
+    local repo="$USER_REPOS/nova-updater"
+    if [[ ! -f "$repo/install.sh" ]]; then
+        die "system apps need a root-owned copy of nova and the nova-updater
+checkout is missing. Set it up with:
+  curl -fsSL https://raw.githubusercontent.com/schlingel-bernd/nova-updater/main/get-nova.sh | bash -s -- --with-system"
+    fi
+    # >&2, all of it: this function's stdout IS the program path the caller
+    # runs. Three info lines on stdout meant the caller executed
+    # `sudo ":: This needs a root-owned copy…"` with the path tacked on the end.
+    info "This app has a root half, so this machine needs the system scope: a" >&2
+    info "root-owned copy of nova (root must never execute a file you can write)" >&2
+    info "and the helper that lets your updates reach it. Setting it up now —" >&2
+    info "one password prompt." >&2
+    as_root bash "$repo/install.sh" install --with-system >&2 9>&- ||
+        die "could not set up the system scope"
+    [[ -x $ROOT_NOVA ]] || die "the system scope did not install ($ROOT_NOVA is still missing)"
+    echo "$ROOT_NOVA"
+}
+
+# How the system scope was set up (see install.sh): "auto" has a root timer
+# and the passwordless wrapper, "manual" has neither — every system change
+# asks for a password and nothing of nova's runs as root unattended.
+system_mode() { cat /etc/nova-updater/mode 2>/dev/null || echo auto; }
+
+# The root copy is a separate file updated by its own timer, so the two can
+# drift. Read the version out of it rather than executing it — this runs on
+# ordinary commands and there is no reason to start a second process, let
+# alone a privileged path, just to print a number.
+root_version() {
+    [[ -r $ROOT_NOVA ]] || return 1
+    local v; v="$(sed -n 's/^NOVA_VERSION=//p' "$ROOT_NOVA" 2>/dev/null | head -1)"
+    [[ -n $v ]] || return 1
+    echo "$v"
+}
+
+# A root copy from 1.2.1 or earlier cannot self-update (it has no notion of a
+# local scope filter overruling the manifest), so skew there is not something
+# the timer will clear on its own. Say which command does.
+ver_lt() { # a b -> is version a older than b
+    [[ $1 != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]
+}
+
+# Two different pieces of advice, because the two situations are different: a
+# root copy from before 1.3.0 genuinely cannot update itself and needs the
+# bootstrap; anything newer picks the version up from its own timer, or right
+# now through the passwordless wrapper. Sending every skew to the bootstrap
+# told people to re-run a password-gated install for nothing.
+root_skew_advice() { # root_version
+    if ver_lt "$1" 1.3.0; then
+        printf '%s\n' "  a copy from 1.2.1 or older cannot update itself. Re-run the bootstrap once:" \
+            "    curl -fsSL https://raw.githubusercontent.com/schlingel-bernd/nova-updater/main/get-nova.sh | bash -s -- --with-system"
+    elif [[ $(system_mode) == manual ]]; then
+        printf '%s\n' "  manual mode, so nothing updates it unasked. To do it (asks for your password):" \
+            "    nova update --system nova-updater"
+    else
+        printf '%s\n' "  your update timer does this on its next run; to do it now (no password):" \
+            "    nova update --system nova-updater"
+    fi
+}
+
+note_root_skew() {
+    (( QUIET )) && return 0
+    local rv here line; rv="$(root_version)" || return 0
+    # This copy as it is ON DISK, not the version this process started as.
+    # `nova update nova-updater` replaces both copies in one run, and the
+    # process doing it is still the old version in memory: it compared the
+    # fresh root copy against itself and ended every self-update with "the
+    # root-owned copy is 2.1.0; this one is 2.0.0 — update it now".
+    here="$(sed -n 's/^NOVA_VERSION=//p' "$0" 2>/dev/null | head -1)"
+    here="${here:-$NOVA_VERSION}"
+    [[ $rv != "$here" ]] || return 0
+    warn "the root-owned copy of nova is $rv; this one is $here."
+    while IFS= read -r line; do warn "$line"; done < <(root_skew_advice "$rv")
+}
+
+# ---------- paths -----------------------------------------------------------
+USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nova-updater"
+USER_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/nova-updater"
+USER_LIST="$USER_CONFIG_DIR/apps.list"
+USER_CATALOGS="$USER_CONFIG_DIR/catalogs.list"
+USER_REPOS="$USER_DATA_DIR/repos"
+USER_PREFIX="$HOME/.local"
+
+SYS_CONFIG_DIR="/etc/nova-updater"
+SYS_LIST="$SYS_CONFIG_DIR/apps.list"
+SYS_CATALOGS="$SYS_CONFIG_DIR/catalogs.list"
+SYS_DATA_DIR="/var/lib/nova-updater"
+SYS_REPOS="$SYS_DATA_DIR/repos"
+SYS_PREFIX="/usr/local"
+
+# ---------------------------------------------------------------------------
+# Root derives NOTHING about its paths from the environment.
+#
+# pkexec and the systemd unit sanitise HOME and XDG_*, and Fedora's default
+# sudoers resets them — but with `sudo -E`, an env_keep entry, or a distro that
+# preserves HOME, root resolved app names through the "user" paths above. A
+# leaked XDG_CONFIG_HOME was enough to make root run an installer named by a
+# list the calling user can write, and local entries beat catalogs.
+# ---------------------------------------------------------------------------
+if [[ $EUID -eq 0 ]]; then
+    HOME=/root
+    USER_CONFIG_DIR=/root/.config/nova-updater
+    USER_DATA_DIR=/root/.local/share/nova-updater
+    USER_LIST="$USER_CONFIG_DIR/apps.list"
+    USER_CATALOGS="$USER_CONFIG_DIR/catalogs.list"
+    USER_REPOS="$USER_DATA_DIR/repos"
+    USER_PREFIX=/root/.local
+fi
+
+MANIFEST="nova.manifest"
+LS_REMOTE_TIMEOUT=10
+# Every network git call is bounded. An unbounded clone or fetch on a flaky
+# link hangs the background timer, and because that run holds the scope lock,
+# every later nova command fails with "another instance is already running"
+# until the machine is rebooted. Observed in the field; this is the fix.
+NET_TIMEOUT="${NOVA_NET_TIMEOUT:-180}"
+
+# nova only ever reads PUBLIC repos — never prompt for credentials
+# (no terminal prompt, no askpass popup, no keyring credential helper)
+#
+# Through the ENVIRONMENT (git >= 2.31), not a shell function. The function
+# this replaces was bypassed by `timeout … git ls-remote`, which execs the git
+# binary directly — so the one call nova makes against every URL it has ever
+# been told about was also the one call that still invoked the user's
+# credential helper (keyring, gh, a stored token) whenever a URL answered 401.
+export GIT_TERMINAL_PROMPT=0
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=
+unset GIT_ASKPASS SSH_ASKPASS 2>/dev/null || true
+
+# Transport allowlist, enforced by git itself. `nova list` clones every entry
+# of every registered catalog before you have chosen to install anything, and
+# the root timer does the same as root — so the set of usable transports should
+# not be "whatever this git was built with". git blocks ext:: by default
+# already; this is the belt to that braces.
+export GIT_ALLOW_PROTOCOL=https:http:file
+
+# git that talks to a remote: hard wall-clock cap, plus git's own stalled
+# transfer abort so a connection that goes quiet does not sit there.
+git_net() {
+    timeout --kill-after=10 "$NET_TIMEOUT" \
+        env GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30 \
+        git "$@"
+}
+
+# ---------- output ----------------------------------------------------------
+QUIET=0
+NOTIFY=0
+
+c_bold=$'\033[1m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_red=$'\033[31m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+[[ -t 1 ]] || { c_bold=""; c_grn=""; c_ylw=""; c_red=""; c_dim=""; c_off=""; }
+
+log()  { (( QUIET )) || printf '%s\n' "$*"; }
+info() { (( QUIET )) || printf '%s::%s %s\n' "$c_bold" "$c_off" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$c_ylw" "$c_off" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+
+notify() { # summary body
+    (( NOTIFY )) || return 0
+    command -v notify-send >/dev/null 2>&1 || return 0
+    # the desktop app is "Nova Apps"; the project is nova-updater (see 1.1.3)
+    notify-send --app-name="Nova Apps" --icon=eu.novanetwork.NovaUpdater "$1" "$2" 2>/dev/null || true
+}
+
+# ---------- helpers ---------------------------------------------------------
+as_root() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    elif [[ -t 0 ]] && command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    elif command -v pkexec >/dev/null 2>&1; then
+        pkexec "$@"
+    else
+        die "need root privileges but neither sudo (tty) nor pkexec is available"
+    fi
+}
+
+# A list decides which installers run, and as root that means which installers
+# run as root. Refuse one that is not root-owned, or that anyone else can
+# write. Unprivileged runs trust the user's own files as before.
+list_trusted() { # file
+    [[ $EUID -eq 0 ]] || return 0
+    local st owner mode
+    st="$(stat -c '%u %a' "$1" 2>/dev/null)" || return 0   # missing: nothing to read
+    read -r owner mode <<<"$st"
+    if [[ $owner != 0 ]]; then
+        warn "ignoring $1: not owned by root"
+        return 1
+    fi
+    if (( (8#$mode & 8#022) != 0 )); then
+        warn "ignoring $1: writable by group or other (mode $mode)"
+        return 1
+    fi
+    return 0
+}
+
+list_file()  { [[ $1 == system ]] && echo "$SYS_LIST"   || echo "$USER_LIST"; }
+repos_dir()  { [[ $1 == system ]] && echo "$SYS_REPOS"  || echo "$USER_REPOS"; }
+prefix_for() { [[ $1 == system ]] && echo "$SYS_PREFIX" || echo "$USER_PREFIX"; }
+
+# The scopes whose clones this invocation can actually read. Not the same as
+# the --user/--system filter: a listing describes both halves of a dual-scope
+# app whichever one you asked about.
+real_scopes() { [[ $EUID -eq 0 ]] && echo system || echo "user system"; }
+
+catalogs_dir() { [[ $EUID -eq 0 ]] && echo "$SYS_DATA_DIR/catalogs" || echo "$USER_DATA_DIR/catalogs"; }
+
+catalog_urls() {
+    local f files=()
+    [[ $EUID -eq 0 ]] && files=("$SYS_CATALOGS") || files=("$USER_CATALOGS" "$SYS_CATALOGS")
+    for f in "${files[@]}"; do
+        [[ -r $f ]] && list_trusted "$f" && grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null
+    done | sort -u
+}
+
+# the registered catalogs, minus anything unusable
+valid_catalog_urls() {
+    local u
+    while read -r u _; do
+        [[ -z ${u:-} ]] && continue
+        valid_url "$u" || { warn "ignoring unusable catalog url: '$u'"; continue; }
+        printf '%s\n' "$u"
+    done < <(catalog_urls)
+}
+
+# clone/refresh all registered catalog repos (best effort — offline is fine)
+sync_catalogs() {
+    local url _ dir cdir; cdir="$(catalogs_dir)"
+    while read -r url _; do
+        [[ -z $url ]] && continue
+        dir="$cdir/$(dir_name "$url")"
+        if [[ -d "$dir/.git" ]]; then
+            { git_net -C "$dir" fetch --quiet origin 2>/dev/null &&
+              git -C "$dir" reset --hard --quiet origin/HEAD 2>/dev/null; } ||
+                warn "catalog sync failed, using cached copy: $url"
+        else
+            mkdir -p "$cdir"
+            git_net clone --quiet -- "$url" "$dir" 2>/dev/null || warn "cannot fetch catalog: $url"
+        fi
+    done < <(valid_catalog_urls)
+}
+
+# ---------------------------------------------------------------------------
+# An app declares which privilege scopes it needs; a catalog lists it ONCE.
+#
+# In the original design scope was a property of *which list the repo was in*,
+# so an app needing both halves — a root daemon plus a user GUI — had to be
+# listed twice, showed up twice, and could not be named unambiguously on the
+# command line. The two privilege domains themselves are real and stay: root
+# must never execute a file the user can write, so system apps are cloned as
+# root into /var/lib and user apps into ~/.local. What changes is who decides.
+# ---------------------------------------------------------------------------
+
+# where we clone purely to READ a manifest (never to execute a system install)
+meta_dir() { [[ $EUID -eq 0 ]] && echo "$SYS_REPOS" || echo "$USER_REPOS"; }
+
+# every entry we know about, in precedence order and NOT deduped:
+# "source<TAB>url<TAB>opts", source being the list file it came from.
+#
+# opts goes LAST because it may be empty, and in `IFS=$'\t' read` a tab is IFS
+# whitespace: two tabs in a row collapse into one separator. With opts in the
+# middle, a catalog entry without options read back as opts=<the catalog's
+# path> and source="" — so from 1.7.1 every catalog app carried its catalog's
+# file name as its "options", and anything keyed on the source saw nothing.
+app_entries_raw() {
+    local f url opts c lists=("$USER_LIST" "$SYS_LIST")
+    # as root there is no user scope: never resolve an app name from a list the
+    # calling user could write
+    [[ $EUID -eq 0 ]] && lists=("$SYS_LIST")
+    for f in "${lists[@]}"; do
+        [[ -r $f ]] || continue
+        list_trusted "$f" || continue
+        while read -r url opts; do
+            [[ -z ${url:-} ]] && continue
+            # an entry in the system list is itself a scope filter
+            [[ $f == "$SYS_LIST" && $opts != *scope=* ]] && opts="${opts:-} scope=system"
+            # mark it as coming from a list on THIS machine rather than from
+            # a catalog — app_scopes lets a local scope= filter overrule the
+            # manifest, and a catalog must not get that power
+            opts="${opts:-} local=1"
+            printf '%s\t%s\t%s\n' "$f" "$url" "${opts:-}"
+        done < <(grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null || true)
+    done
+    for c in "$(catalogs_dir)"/*/; do
+        [[ -f "${c}apps.list" ]] || continue
+        list_trusted "${c}apps.list" || continue
+        while read -r url opts; do
+            [[ -z ${url:-} ]] && continue
+            printf '%s\t%s\t%s\n' "${c}apps.list" "$url" "${opts:-}"
+        done < <(grep -Ev '^[[:space:]]*(#|$)' "${c}apps.list" 2>/dev/null || true)
+    done
+}
+
+# every app we know about, deduped by repo name, regardless of scope:
+# "url<TAB>opts". A list on this machine wins over a catalog.
+app_entries() {
+    local url opts d seen=" " _src
+    while IFS=$'\t' read -r _src url opts; do
+        [[ -z $url ]] && continue
+        valid_url "$url" || continue     # reported once by check_lists
+        d="$(dir_name "$url")"
+        [[ $seen == *" $d "* ]] && continue
+        seen+="$d "
+        printf '%s\t%s\n' "$url" "${opts:-}"
+    done < <(app_entries_raw)
+}
+
+# The dedup above silently drops the loser, which is fine when two lists name
+# the SAME repo and wrong when they name different ones: one app then shadows
+# the other and `nova install <name>` is ambiguous. Say so once, out loud.
+check_lists() {
+    local -A first_url=() reported=()
+    local url opts d u src
+    while IFS=$'\t' read -r src url opts; do
+        [[ -z $url ]] && continue
+        if ! valid_url "$url"; then
+            # Name the file. "ignoring an unusable entry" with no location sent
+            # people hunting through four lists for a line that an old
+            # `nova add <name>` had written years ago.
+            warn "ignoring an unusable entry in $src: '$url'"
+            warn "  a list holds git URLs (https://…, or an absolute path), not app names."
+            warn "  delete that line, or replace it with the repo's URL: nova add <url>"
+            continue
+        fi
+        d="$(dir_name "$url")"; u="$(norm_url "$url")"
+        if [[ -z ${first_url[$d]:-} ]]; then
+            first_url[$d]="$u"
+        elif [[ ${first_url[$d]} != "$u" && -z ${reported[$d]:-} ]]; then
+            reported[$d]=1
+            warn "two different repos are both called '$d':"
+            warn "    using  ${first_url[$d]}"
+            warn "   hidden  $u"
+            warn "  only the first can be installed under that name."
+        fi
+    done < <(app_entries_raw)
+}
+
+# clone/refresh just enough to read the manifest. Cheap, unprivileged, and the
+# only way to know what an app needs before deciding how to install it.
+# The clone directory is the repo's BASENAME, so a cached directory can outlive
+# a change of URL behind that name. Reading the origin tells us whether the
+# clone we have is really the repo the list is talking about.
+repo_origin() { # dir -> origin url, empty if there is none
+    local u
+    u="$(git -C "$1" remote get-url origin 2>/dev/null)" && [[ -n $u ]] && { echo "$u"; return; }
+    # git refuses a repo owned by another user ("dubious ownership"); the
+    # config file itself is world-readable
+    sed -n '/^\[remote "origin"\]/,/^\[/s/^[[:space:]]*url[[:space:]]*=[[:space:]]*//p' \
+        "$1/.git/config" 2>/dev/null | head -1
+}
+
+origin_differs() { # dir url
+    local have; have="$(repo_origin "$1")"
+    [[ -n $have ]] || return 1
+    [[ "$(norm_url "$have")" != "$(norm_url "$2")" ]]
+}
+
+sync_meta() { # url opts -> repo dir on stdout
+    local url="$1" opts="${2:-}" dir
+    dir="$(meta_dir)/$(dir_name "$url")"
+    if [[ ! -d "$dir/.git" ]]; then
+        mkdir -p "$(dirname "$dir")"
+        # --depth 1: browsing a catalog should not mean downloading every
+        # app's entire history. These clones exist to read a manifest. The one
+        # that gets installed from is deepened again in sync_repo, because a
+        # specific commit — an older tag, a pin — has to be reachable.
+        git_net clone --quiet --depth 1 -- "$url" "$dir" 2>/dev/null ||
+            git_net clone --quiet -- "$url" "$dir" 2>/dev/null || return 1
+    elif origin_differs "$dir" "$url" && [[ ! -f "$dir/.nova-installed" ]]; then
+        # nothing was installed from this clone, so it is only a cache: point
+        # it at the URL the list actually names
+        git -C "$dir" remote set-url origin -- "$url" 2>/dev/null &&
+            git_net -C "$dir" fetch --quiet --tags origin 2>/dev/null || true
+    fi
+    echo "$dir"
+}
+
+# which scopes this app actually wants, honouring a catalog/list filter
+app_scopes() { # dir opts
+    local dir="$1" opts="${2:-}" declared filter out=() sc
+    declared="$(manifest_get "$dir" SCOPES "$(manifest_get "$dir" SCOPE user)")"
+    [[ $declared == both || $declared == any ]] && declared="user system"
+    filter="$(entry_opt "$opts" scope "")"
+    split_words "$declared"                  # manifest data: no globbing
+    local -a decl=(${WORDS[@]+"${WORDS[@]}"})
+    for sc in ${decl[@]+"${decl[@]}"}; do
+        [[ $sc == user || $sc == system ]] || continue
+        [[ -n $filter && $sc != "$filter" ]] && continue
+        out+=("$sc")
+    done
+    if [[ ${#out[@]} -eq 0 && -n $filter ]]; then
+        # A scope= filter on an entry in /etc/nova-updater/apps.list (or the
+        # user's own apps.list) is a decision about THIS machine, so it wins
+        # over what the app's manifest declares. Catalog entries do not get
+        # that power — there the manifest is the authority.
+        #
+        # Without this the root-owned nova could never update itself: its entry
+        # in the system list asks for the system scope, its manifest declares
+        # SCOPES=user, the intersection was empty, and the system timer failed
+        # every six hours with "no apps matched" while the copy running as root
+        # never received a single fix.
+        if [[ "$(entry_opt "$opts" local 0)" == 1 ]]; then
+            echo "$filter"; return 0
+        fi
+        warn "$(basename "$dir"): asked for the $filter scope but its manifest declares '$declared'"
+    fi
+    echo "${out[*]:-}"
+}
+
+# The scopes to act on: what the entry and manifest declare, PLUS any scope the
+# app is actually installed in.
+#
+# An app can be listed in both local lists — nova-updater is, by design — and
+# app_entries dedups by name, so the second entry's scope= filter is thrown
+# away. nova-updater then looked like a user-only app: `nova list` labelled it
+# scopes=user and `nova update` only ever touched the user half, while the
+# marker comparison correctly saw the root half was behind. The result was an
+# update-available that no command the user could run would ever clear.
+#
+# Something already installed is a fact. It outranks what one list entry
+# happened to say.
+effective_scopes() { # dir opts url
+    local scs sc
+    scs="$(app_scopes "$1" "${2:-}")"
+    for sc in $(real_scopes); do
+        is_installed "$sc" "$3" || continue
+        [[ " $scs " == *" $sc "* ]] && continue
+        scs="${scs:+$scs }$sc"
+    done
+    echo "$scs"
+}
+
+# Fetch every known app's metadata so listings can show what things actually
+# are. A catalog entry is just a URL — the description, components and scopes
+# all live in the app's own manifest, so browsing means having the manifests.
+# Clones are cached, so this is slow once and instant afterwards.
+#
+# In parallel, because these are independent network round trips and doing a
+# catalog of fifty tools strictly one after another is the slowest part of a
+# first `nova list` by a wide margin.
+sync_all_meta() {
+    local url opts line todo=() running=0 max="${NOVA_FETCH_JOBS:-4}"
+    while IFS=$'\t' read -r url opts; do
+        [[ -z $url ]] && continue
+        [[ -d "$(meta_dir)/$(dir_name "$url")/.git" ]] && continue
+        todo+=("$url"$'\t'"${opts:-}")
+    done < <(app_entries)
+    [[ ${#todo[@]} -eq 0 ]] && return 0
+    info "fetching details for ${#todo[@]} app(s) (first run only)…"
+    for line in "${todo[@]}"; do
+        IFS=$'\t' read -r url opts <<<"$line"
+        ( sync_meta "$url" "$opts" >/dev/null 2>&1 || warn "cannot reach $url" ) &
+        running=$((running+1))
+        if (( running >= max )); then wait -n 2>/dev/null || true; running=$((running-1)); fi
+    done
+    wait
+    info "fetched ${#todo[@]} app(s)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# What is installed is recorded in each scope's own marker, so that is what a
+# "newer version available?" question has to be asked against.
+#
+# It used to compare the remote against HEAD of the *metadata* clone in the
+# user's home. For a system app that is the wrong repository entirely: after
+# root updated it, the user's metadata clone had not moved, so the app showed
+# update-available for ever — and because the GUI is a thin layer over
+# `list --porcelain --check`, it showed "1 update ready" permanently.
+# ---------------------------------------------------------------------------
+
+# the commit a scope actually installed (line 1 of its marker). The system
+# repos are world-readable, so a user can read root's record directly, which
+# `git -C` cannot do: it refuses another user's repo as "dubious ownership".
+marker_sha() { # repo_dir
+    head -1 "$1/.nova-installed" 2>/dev/null || true
+}
+
+is_installed_any() { # url
+    local sc
+    for sc in $(real_scopes); do is_installed "$sc" "$1" && return 0; done
+    return 1
+}
+
+# the clone that describes what is installed; the metadata clone if nothing is
+scope_dir() { # scope url
+    echo "$(repos_dir "$1")/$(dir_name "$2")"
+}
+installed_dir() { # url
+    local sc
+    for sc in $(real_scopes); do
+        is_installed "$sc" "$1" && { scope_dir "$sc" "$1"; return; }
+    done
+    echo "$(meta_dir)/$(dir_name "$1")"
+}
+
+# The target for ONE scope can differ from the row's. Each scope's own list
+# entry may pin or track a branch — the user pins their half while root's
+# list keeps following releases — and the dedup keeps only one entry's opts.
+# Asking "is this scope outdated?" against the row target marked the root
+# half update-available for ever the moment the user pinned: both halves sat
+# exactly where their own configuration wanted them, `nova update` said "up
+# to date", and nothing the user could do cleared the indicator. Third member
+# of the stuck-indicator family, after F8 and the 1.3.1 dedup bug.
+#
+# Both list files are world-readable, so either side can read the other's
+# opts. The extra ls-remote happens only when the opts actually differ.
+scope_target_sha() { # scope url row_opts row_sha
+    local f so t sha
+    f="$(list_file "$1")"
+    if list_has "$f" "$2"; then so="$(entry_opts "$f" "$2")"; else so="${3:-}"; fi
+    if [[ "$(entry_opt "${so:-}" ref "")" == "$(entry_opt "${3:-}" ref "")" &&
+          "$(entry_opt "${so:-}" branch "")" == "$(entry_opt "${3:-}" branch "")" ]]; then
+        echo "$4"; return 0
+    fi
+    t="$(remote_target "$2" "${so:-}" || true)"
+    [[ -n $t ]] || { echo ""; return 0; }
+    IFS=$'\t' read -r sha _ <<<"$t"
+    echo "$sha"
+}
+
+# which installed scopes of this app are not sitting on their own target
+outdated_scopes() { # url row_opts row_sha -> scope names
+    local sc out=() sha
+    for sc in $(real_scopes); do
+        is_installed "$sc" "$1" || continue
+        sha="$(scope_target_sha "$sc" "$1" "${2:-}" "$3")"
+        [[ -n $sha ]] || continue      # that scope's remote unknowable — say nothing
+        [[ "$(marker_sha "$(scope_dir "$sc" "$1")")" == "$sha" ]] || out+=("$sc")
+    done
+    echo "${out[*]:-}"
+}
+
+# Bring a metadata-only clone up to the release an install would use, so a
+# listing shows what you would get rather than whatever was current the day the
+# app was first listed. A clone something was installed from is never touched
+# here: moving its working tree behind the installer's back is `update`'s job.
+refresh_meta() { # url opts
+    local dir t sha
+    dir="$(meta_dir)/$(dir_name "$1")"
+    [[ -d "$dir/.git" && ! -f "$dir/.nova-installed" ]] || return 0
+    t="$(remote_target "$1" "${2:-}" || true)"
+    [[ -n $t ]] || return 0
+    IFS=$'\t' read -r sha _ <<<"$t"
+    [[ "$(local_head "$dir")" == "$sha" ]] && return 0
+    git_net -C "$dir" fetch --quiet --tags origin 2>/dev/null &&
+        checkout_target "$dir" "$sha" ||
+        warn "could not refresh the cached details for $1"
+    return 0
+}
+
+# `nova sync` means "bring what you know up to date", which includes the cached
+# manifests, not only the catalog lists.
+refresh_all_meta() {
+    local url opts
+    while IFS=$'\t' read -r url opts; do
+        [[ -z $url ]] && continue
+        refresh_meta "$url" "$opts"
+    done < <(app_entries)
+}
+
+scope_label() { # "user system" -> "user+system"
+    local j="$*"
+    echo "${j// /+}"
+}
+
+
+# ---------------------------------------------------------------------------
+# List files hold one URL per line plus options. They were searched with
+# `grep -qF` and rewritten with `grep -vF`, which matches a SUBSTRING: with
+# .../foo-bar listed, `nova add .../foo` answered "already in", and purging
+# .../foo deleted the .../foo-bar line as well. The rewrite was `cat tmp >
+# file`, which leaves a truncated list if it is interrupted.
+#
+# Compare the first field exactly, ignoring a trailing slash and .git so the
+# three spellings of one repo are one entry.
+# ---------------------------------------------------------------------------
+norm_url() { local u="${1%/}"; echo "${u%.git}"; }
+
+# A URL out of a catalog is data from someone else, and it is about to be
+# handed to git and turned into a directory name. Nothing checked its scheme or
+# its shape, and nothing put `--` in front of it. No exploit was demonstrated,
+# so this is defence in depth: a shape that cannot be mistaken for an option,
+# and a basename that cannot escape the repos directory.
+valid_url() { # url
+    local u="$1" b
+    [[ -n $u ]] || return 1
+    [[ $u == -* ]] && return 1                       # would read as an option
+    [[ $u == *[[:space:]]* ]] && return 1
+    [[ $u == *[[:cntrl:]]* ]] && return 1
+    case "$u" in
+        https://?*|http://?*|file:///?*|/?*) ;;      # local paths: dev and tests
+        *) return 1 ;;
+    esac
+    b="$(dir_name "$u")"
+    [[ -n $b && $b != . && $b != .. && $b != */* ]] || return 1
+    return 0
+}
+
+list_has() { # file url
+    [[ -r $1 ]] || return 1
+    local want u; want="$(norm_url "$2")"
+    while read -r u _; do
+        [[ -z ${u:-} || $u == \#* ]] && continue
+        [[ "$(norm_url "$u")" == "$want" ]] && return 0
+    done < "$1"
+    return 1
+}
+
+list_drop() { # file url -> rewrite without that entry, atomically
+    [[ -f $1 ]] || return 0
+    local want u line tmp; want="$(norm_url "$2")"
+    tmp="$(mktemp "$1.XXXXXX")" || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        read -r u _ <<<"$line" || true
+        [[ -n ${u:-} && $u != \#* && "$(norm_url "$u")" == "$want" ]] && continue
+        printf '%s\n' "$line"
+    done < "$1" > "$tmp"
+    chmod --reference="$1" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$1"
+}
+
+# Set or clear ONE key=value option on the entry for <url>, keeping the rest of
+# the line and the rest of the file intact. An empty value removes the key. The
+# entry is appended when it is not there yet, which is what makes `nova pin` on
+# a catalog app work: a local entry overrides the catalog's.
+list_set_opt() { # file url key value
+    local f="$1" url="$2" key="$3" val="${4:-}"
+    local want line u rest tmp kv newopts found=0
+    want="$(norm_url "$url")"
+    mkdir -p "$(dirname "$f")" && touch "$f" || return 1
+    tmp="$(mktemp "$f.XXXXXX")" || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        read -r u rest <<<"$line" || true
+        if [[ -n ${u:-} && $u != \#* && "$(norm_url "$u")" == "$want" ]]; then
+            found=1
+            newopts=""
+            split_words "${rest:-}"
+            for kv in ${WORDS[@]+"${WORDS[@]}"}; do
+                [[ $kv == "$key="* ]] && continue
+                newopts+="${newopts:+ }$kv"
+            done
+            [[ -n $val ]] && newopts+="${newopts:+ }$key=$val"
+            printf '%s%s\n' "$u" "${newopts:+ $newopts}"
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$f" > "$tmp"
+    (( found )) || [[ -z $val ]] || printf '%s %s=%s\n' "$url" "$key" "$val" >> "$tmp"
+    chmod --reference="$f" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$f"
+}
+
+# the options carried by the entry for <url>, empty when it has none or is absent
+entry_opts() { # file url
+    local f="$1" want u rest; want="$(norm_url "$2")"
+    [[ -r $f ]] || return 0
+    while read -r u rest; do
+        [[ -z ${u:-} || $u == \#* ]] && continue
+        [[ "$(norm_url "$u")" == "$want" ]] && { printf '%s' "${rest:-}"; return 0; }
+    done < "$f"
+}
+
+# is this URL listed by a registered catalog, as opposed to only locally?
+catalog_has_url() { # url
+    local c
+    for c in "$(catalogs_dir)"/*/apps.list; do
+        [[ -f $c ]] || continue
+        list_has "$c" "$1" && return 0
+    done
+    return 1
+}
+
+dir_name() { # url -> repo directory name
+    local b; b="$(basename "$1")"
+    echo "${b%.git}"
+}
+
+# A list that came from someone else is split on whitespace and NOTHING else.
+# `for kv in $opts` also globs: a catalog line carrying `ref=*` would have been
+# replaced by the names of whatever files sat in nova's current directory.
+split_words() { # string -> array WORDS
+    WORDS=()
+    read -ra WORDS <<<"${1:-}"
+}
+
+entry_opt() { # opts key default   (opts: "key=val key=val")
+    local kv
+    split_words "${1:-}"
+    for kv in ${WORDS[@]+"${WORDS[@]}"}; do
+        [[ $kv == "$2="* ]] && { echo "${kv#*=}"; return; }
+    done
+    echo "$3"
+}
+
+# Pure bash on purpose. A listing reads a dozen fields per app, so the previous
+# grep | head | cut per field meant thousands of processes for a catalog of any
+# size — and the value went into the tab-separated porcelain unsanitised.
+#
+# A manifest saved with CRLF produced SCOPES=user$'\r', which matches no scope,
+# so the app was skipped and the user was told "no apps matched (is your
+# apps.list empty?)". Tabs and control characters went straight through to the
+# porcelain and the terminal.
+#
+# Inline comments are deliberately NOT stripped: a DESCRIPTION may contain a #.
+manifest_get() { # repo_dir key default
+    local v="" line f="$1/$MANIFEST"
+    if [[ -f $f ]]; then
+        while IFS= read -r line || [[ -n $line ]]; do
+            [[ $line == "$2="* ]] || continue
+            v="${line#*=}"
+            break
+        done < "$f"
+        v="${v//$'\t'/ }"           # a tab would split a porcelain field
+        v="${v//[[:cntrl:]]/}"      # the CR of a CRLF file, and anything else
+        v="${v%"${v##*[![:space:]]}"}"   # trailing whitespace
+    fi
+    echo "${v:-$3}"
+}
+
+# NAME is shown in listings, typed on the command line and handed to the root
+# wrapper, so it has to look like a name. A manifest that disagrees falls back
+# to the repo's directory name rather than putting something shaped like an
+# option where a name is expected.
+manifest_name() { # repo_dir fallback
+    local n; n="$(manifest_get "$1" NAME "")"
+    if [[ ! $n =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        [[ -n $n ]] && warn "ignoring unusable NAME '$n' in $1/$MANIFEST"
+        n="$2"
+    fi
+    echo "$n"
+}
+
+app_name() { # scope url -> manifest NAME if cloned, else dir name
+    local d; d="$(repos_dir "$1")/$(dir_name "$2")"
+    manifest_name "$d" "$(dir_name "$2")"
+}
+
+is_installed() { # scope url
+    [[ -f "$(repos_dir "$1")/$(dir_name "$2")/.nova-installed" ]]
+}
+
+# marker records the installed commit plus whether GUI parts were installed
+# (the effective NOVA_GUI decision) — so listings and updates stay consistent
+write_marker() { # repo_dir
+    # Both values BEFORE the file is opened. `>` truncates it, and
+    # effective_gui reads the previous gui= line out of that same file to keep
+    # a cli-only install cli-only — so the old value was already gone and the
+    # flavour fell back to auto-detection. On a desktop that meant a
+    # --cli-only app quietly grew its GUI on the second update.
+    #
+    # Temp file plus mv, so an interrupted write cannot leave a marker with a
+    # commit and no flavour.
+    local g h
+    g="$(effective_gui "$1")"
+    h="$(local_head "$1")"
+    printf '%s\ngui=%s\n' "$h" "$g" > "$1/.nova-installed.tmp" &&
+        chmod 644 "$1/.nova-installed.tmp" &&
+        mv -f "$1/.nova-installed.tmp" "$1/.nova-installed"
+}
+
+marker_gui() { # scope url -> 0 | 1 | "" (pre-0.5 markers have no flag)
+    grep -m1 '^gui=' "$(repos_dir "$1")/$(dir_name "$2")/.nova-installed" 2>/dev/null | cut -d= -f2
+}
+
+local_head() { # repo_dir
+    if git -C "$1" rev-parse HEAD 2>/dev/null; then return; fi
+    # fallback: read the refs by hand. git refuses repos owned by another
+    # user ("dubious ownership") — e.g. a regular user listing the root-owned
+    # system repos — but the files themselves are world-readable.
+    local head ref
+    head="$(cat "$1/.git/HEAD" 2>/dev/null)" || { echo "-"; return; }
+    if [[ $head == ref:* ]]; then
+        ref="${head#ref: }"
+        if [[ -f "$1/.git/$ref" ]]; then
+            cat "$1/.git/$ref"
+        else
+            awk -v r="$ref" '$2==r{print $1; exit}' "$1/.git/packed-refs" 2>/dev/null | grep . || echo "-"
+        fi
+    else
+        echo "$head"   # detached HEAD stores the commit sha directly
+    fi
+}
+
+# resolve the commit an app should be at: ref= pin > branch= > latest tag > HEAD
+remote_target() { # url opts -> "sha<TAB>refname"; empty output on failure
+    local url="$1" opts="${2:-}" out sha="" ref branch tag
+    out="$(timeout "$LS_REMOTE_TIMEOUT" git ls-remote --quiet -- "$url" 2>/dev/null)" || return 1
+    [[ -n $out ]] || return 1
+    ref="$(entry_opt "$opts" ref "")"
+    branch="$(entry_opt "$opts" branch "")"
+    if [[ -n $ref ]]; then
+        # prefer the peeled commit of an annotated tag
+        sha="$(awk -v r="$ref" '$2=="refs/tags/"r"^{}"{print $1;exit}' <<<"$out")"
+        [[ -n $sha ]] || sha="$(awk -v r="$ref" '$2=="refs/tags/"r || $2=="refs/heads/"r{print $1;exit}' <<<"$out")"
+        [[ -n $sha ]] && printf '%s\t%s\n' "$sha" "$ref"
+    elif [[ -n $branch ]]; then
+        sha="$(awk -v b="$branch" '$2=="refs/heads/"b{print $1;exit}' <<<"$out")"
+        [[ -n $sha ]] && printf '%s\t%s\n' "$sha" "$branch"
+    else
+        # A RELEASE is a version tag and nothing else. Every tag used to be a
+        # candidate, and `sort -V` puts v2.0.0-rc1 after v2.0.0 — so the moment
+        # a release candidate existed, the final release was never installed
+        # again. A tag called wip-test beat every version tag there was.
+        # Pre-releases stay reachable through an explicit ref= pin.
+        tag="$(awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/{sub("refs/tags/","",$2); print $2}' <<<"$out" \
+               | grep -E '^v?[0-9]+(\.[0-9]+){0,3}$' | sort -V | tail -1 || true)"
+        if [[ -n $tag ]]; then
+            sha="$(awk -v t="$tag" '$2=="refs/tags/"t"^{}"{print $1;exit}' <<<"$out")"
+            [[ -n $sha ]] || sha="$(awk -v t="$tag" '$2=="refs/tags/"t{print $1;exit}' <<<"$out")"
+            printf '%s\t%s\n' "$sha" "$tag"
+        else
+            awk '$2=="HEAD"{print $1"\tHEAD";exit}' <<<"$out"
+        fi
+    fi
+}
+
+# resolve a user-supplied name to "scope<TAB>url<TAB>opts"; empty if not found.
+# a name can exist in both scopes (e.g. nova-updater) — first scope wins,
+# --user/--system disambiguates.
+resolve() { # name -> "url<TAB>opts"
+    local url opts
+    while IFS=$'\t' read -r url opts; do
+        [[ -z $url ]] && continue
+        if [[ "$(dir_name "$url")" == "$1" ]]; then
+            printf '%s\t%s\n' "$url" "${opts:-}"; return 0
+        fi
+    done < <(app_entries)
+    # fall back to the manifest NAME, which needs a clone to read
+    while IFS=$'\t' read -r url opts; do
+        [[ -z $url ]] && continue
+        local d; d="$(meta_dir)/$(dir_name "$url")"
+        if [[ -d $d && "$(manifest_name "$d" "")" == "$1" ]]; then
+            printf '%s\t%s\n' "$url" "${opts:-}"; return 0
+        fi
+    done < <(app_entries)
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# What root can resolve, answered from root-owned sources only. Both
+# /etc/nova-updater/apps.list and the catalogs under /var/lib/nova-updater are
+# world-readable, so this needs no privilege and no prompt.
+#
+# It compares the URL, not just the name. Root re-resolves the name against
+# its own lists, so a name meaning one repo to the user can mean a different
+# repo to root — and the user would have been shown one app's ROOT_REASON
+# while root installed the other one.
+# ---------------------------------------------------------------------------
+root_url_for() { # dirname -> the url root would resolve it to
+    local url c
+    # same precedence as app_entries_raw: the local list first, then catalogs
+    for c in "$SYS_LIST" "$SYS_DATA_DIR"/catalogs/*/apps.list; do
+        [[ -r $c ]] || continue
+        while read -r url _; do
+            [[ -z ${url:-} || $url == \#* ]] && continue
+            [[ "$(dir_name "$url")" == "$1" ]] && { norm_url "$url"; return 0; }
+        done < "$c"
+    done
+    return 1
+}
+
+root_knows() { # url
+    [[ "$(root_url_for "$(dir_name "$1")" || true)" == "$(norm_url "$1")" ]]
+}
+
+acquire_lock() { # scope
+    local lock dir me
+    if [[ $1 == system ]]; then dir="$SYS_DATA_DIR"; else dir="$USER_DATA_DIR"; fi
+    mkdir -p "$dir"; lock="$dir/lock"
+    me="$(hostname 2>/dev/null || echo unknown)"
+
+    # fd 9 is inherited by every child unless it is closed explicitly, so each
+    # exec of something that might outlive us closes it (`9>&-`). An installer
+    # that starts a background process outside systemd used to leave that
+    # process holding the flock after nova exited, and every later nova command
+    # then waited and failed with "another nova is already running", naming a
+    # pid that no longer existed. Same wedge 1.2.0 fixed for stalled fetches,
+    # reached a different way.
+    #
+    # Open read-write rather than truncating: a plain > would wipe the holder's
+    # own record on the way to discovering we cannot have the lock, so we could
+    # never say who has it.
+    exec 9<>"$lock" || die "cannot open the lock file $lock"
+
+    # Wait a little before giving up. The overwhelmingly common collision is the
+    # background update timer firing while you type a command, and that is over
+    # in seconds — failing instantly turns a non-event into an error.
+    if ! flock -w "${NOVA_LOCK_WAIT:-20}" 9; then
+        local who host
+        who="$(head -1 "$lock" 2>/dev/null || true)"
+        host="${who%% *}"
+        if [[ -n $host && $host != "$me" ]]; then
+            die "another nova is holding the $1 lock on host '$host' ($who).
+Your home directory is shared between machines, so they share this lock too.
+Wait for that run to finish, or raise NOVA_LOCK_WAIT."
+        fi
+        die "another nova is already running ($1 scope)${who:+: $who}.
+The background update timer may have it; it normally finishes in seconds.
+Retry, or raise NOVA_LOCK_WAIT (currently ${NOVA_LOCK_WAIT:-20}s)."
+    fi
+
+    # record who holds it, so the next caller can say something useful
+    printf '%s pid=%s started=%s\n' "$me" "$$" "$(date -Is 2>/dev/null)" > "$lock"
+}
+
+# 1 if the machine has a GTK4 stack (desktop), 0 on headless/server installs.
+# Deliberately NOT based on $DISPLAY — ssh sessions to desktops have none.
+gui_available() {
+    [[ -n ${NOVA_GUI:-} ]] && { echo "$NOVA_GUI"; return; }
+    if [[ -e /usr/lib64/girepository-1.0/Gtk-4.0.typelib ||
+          -e /usr/lib/girepository-1.0/Gtk-4.0.typelib ]]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+# decide the GUI flavor (0/1) for an install/update:
+#   explicit --cli-only/--gui flag  >  recorded marker (updates keep flavor)
+#   >  auto-detect (GTK4 present?). Never upgrades a cli-only app to gui on
+#   update unless you ask, and never installs gui on a headless box.
+effective_gui() { # repo_dir
+    if [[ -n $GUI_CHOICE ]]; then echo "$GUI_CHOICE"; return; fi
+    local m; m="$(grep -m1 '^gui=' "$1/.nova-installed" 2>/dev/null | cut -d= -f2)"
+    [[ $m == 0 || $m == 1 ]] && { echo "$m"; return; }
+    gui_available
+}
+
+# The PATH an installer of <scope> runs with — and the one its DEPENDS are
+# checked against, so nova never warns about a tool the installer will find,
+# nor keeps quiet about one it will not.
+#
+# It cannot simply be inherited, because the routes into an installer differ.
+# pkexec — the passwordless updates, and the GUI asking for root — gives root
+# /usr/sbin:/usr/bin:/sbin:/bin:/root/bin, with no /usr/local/bin; Fedora's
+# sudo secure_path does include it; and a systemd --user manager has
+# ~/.local/bin only when the desktop session imported it, which a headless or
+# lingering one does not. So an installer that called the tool it had just
+# installed by name worked from a terminal and failed on the passwordless
+# route: nova-killswitch 0.2.0 waited ten seconds and reported "the daemon is
+# not answering" while the daemon was up the whole time.
+installer_path() { # scope
+    local prefix; prefix="$(prefix_for "$1")"
+    if [[ $1 == system ]]; then
+        # fixed rather than inherited: root runs what this names, not whatever
+        # a caller's PATH happened to point at
+        echo "$prefix/bin:$prefix/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+    else
+        echo "$prefix/bin:${PATH:-/usr/bin:/bin}"
+    fi
+}
+
+run_installer() { # scope repo_dir action [purge]
+    local scope="$1" dir="$2" action="$3" purge="${4:-0}"
+    local inst; inst="$(manifest_get "$dir" INSTALLER install.sh)"
+    # One unusable app must not abort the run: with --all that would mean the
+    # first broken repo stops every app after it from being updated.
+    [[ -f "$dir/$inst" ]] || { warn "installer '$inst' not found in $dir"; return 1; }
+    local gui; gui="$(effective_gui "$dir")"
+    # --purge has to reach the app. The README promises it "also drops its
+    # config", but nova only ever removed the URL from its own list and called
+    # the installer with a bare `uninstall`, so apps that implement
+    # `uninstall --purge` never heard about it. Passed both ways: as the
+    # argument the convention documents, and in the environment beside the
+    # other NOVA_* variables.
+    local args=("$action")
+    [[ $action == uninstall ]] && (( purge )) && args+=(--purge)
+    info "running $inst ${args[*]} ($scope scope, $([[ $gui == 1 ]] && echo with-gui || echo cli-only))"
+    local prefix; prefix="$(prefix_for "$scope")"
+    # nova's own no-credentials policy is in the environment now, so it would
+    # otherwise be inherited by the app's installer and break one that
+    # legitimately clones something of its own.
+    ( cd "$dir" &&
+      env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+          -u GIT_ALLOW_PROTOCOL \
+          NOVA_SCOPE="$scope" \
+          NOVA_ACTION="$action" \
+          NOVA_APP_DIR="$dir" \
+          NOVA_PREFIX="$prefix" \
+          NOVA_GUI="$gui" \
+          NOVA_PURGE="$purge" \
+          PATH="$(installer_path "$scope")" \
+          bash "./$inst" "${args[@]}" 9>&- )
+}
+
+# Every failure path RETURNS, and none of them die. This runs inside $(...),
+# where `die` exits only the subshell: the caller saw an empty directory, an
+# exit status it was not checking, and carried on to mark the app installed.
+# Metadata clones are shallow (see sync_meta), and the commit we want may be
+# outside that history — an older tag, or a ref= pin. Deepen only when it turns
+# out to be needed, so installing the release you just listed stays cheap.
+checkout_target() { # dir sha
+    local dir="$1" sha="$2"
+    git -C "$dir" -c advice.detachedHead=false checkout --quiet --force "$sha" 2>/dev/null && return 0
+    [[ -f "$dir/.git/shallow" ]] || return 1
+    git_net -C "$dir" fetch --quiet --unshallow --tags origin 2>/dev/null || return 1
+    git -C "$dir" -c advice.detachedHead=false checkout --quiet --force "$sha" 2>/dev/null
+}
+
+sync_repo() { # scope url opts -> clones + checks out the target ref, echoes repo dir
+    local scope="$1" url="$2" opts="${3:-}"
+    valid_url "$url" || { warn "refusing an unusable url: '$url'"; return 1; }
+    local dir; dir="$(repos_dir "$scope")/$(dir_name "$url")"
+    local target sha
+    target="$(remote_target "$url" "$opts" || true)"
+    [[ -n $target ]] || { warn "cannot reach $url"; return 1; }
+    if [[ ! -d "$dir/.git" ]]; then
+        mkdir -p "$(repos_dir "$scope")" || return 1
+        git_net clone --quiet -- "$url" "$dir" || { warn "clone failed: $url"; return 1; }
+        # The user-side view of a system app (installed? which version? an
+        # update?) is read straight out of this clone, so it has to stay
+        # world-readable whatever umask root happens to run with.
+        [[ $scope == system ]] && chmod -R a+rX "$dir" 2>/dev/null
+    elif origin_differs "$dir" "$url"; then
+        # What `nova info` shows and what `nova install` acts on have to be the
+        # same repo. With a stale origin nova fetched from the OLD url, printed
+        # "fatal: reference is not a tree", ran the OLD installer and reported
+        # success.
+        if [[ -f "$dir/.nova-installed" ]]; then
+            warn "$(dir_name "$url") was installed from $(repo_origin "$dir")"
+            warn "  but the list now names $url."
+            warn "  nova will not swap the source of an installed app silently."
+            warn "  remove it first: nova uninstall $(dir_name "$url")"
+            return 1
+        fi
+        warn "$(dir_name "$url"): source changed, repointing the cached clone at $url"
+        git -C "$dir" remote set-url origin -- "$url" || return 1
+    fi
+    IFS=$'\t' read -r sha _ <<<"$target"
+    git_net -C "$dir" fetch --quiet --tags origin || { warn "fetch failed: $url"; return 1; }
+    checkout_target "$dir" "$sha" || { warn "cannot check out $sha in $dir"; return 1; }
+    echo "$dir"
+}
+
+install_one() { # scope url opts
+    local scope="$1" url="$2" opts="${3:-}"
+    local action="install"
+    is_installed "$scope" "$url" && action="update"
+    local dir; dir="$(sync_repo "$scope" "$url" "$opts")" || return 1
+
+    # The manifest is the authority on which scopes an app needs; this is only
+    # a sanity check for a repo that changed its mind since it was listed.
+    local mscopes; mscopes="$(app_scopes "$dir" "$opts")"
+    [[ -n $mscopes && " $mscopes " != *" $scope "* ]] && \
+        warn "$(app_name "$scope" "$url"): manifest declares SCOPES=$mscopes, not $scope"
+
+    # The manifest template says nova "shows what is missing before
+    # installing"; until now only `info --porcelain` did, so the first anyone
+    # heard of a missing dependency was the installer failing on it.
+    local deps miss
+    deps="$(manifest_get "$dir" DEPENDS "")"
+    if [[ -n $deps ]]; then
+        # A dependency that is itself a nova app (a provider module needs
+        # nova-fox) is installed first, in this process; what is left in
+        # DEPS_MISSING is commands no nova app provides, which we can only
+        # warn about.
+        ensure_deps "$scope" "$url" "$deps"
+        miss="${DEPS_MISSING[*]:-}"
+        [[ -n $miss ]] && warn "$(app_name "$scope" "$url") needs these, and they are not here: $miss
+  its installer will probably fail. Install them first if it does."
+    fi
+
+    # set -e does not apply inside a function called on the left of ||, which is
+    # exactly how dispatch calls this one. Check the step, or a failed installer
+    # gets a marker, a success line and exit 0.
+    run_installer "$scope" "$dir" "$action" || {
+        warn "$(app_name "$scope" "$url"): the $action step failed — not recording it as installed"
+        return 1
+    }
+    write_marker "$dir"
+    info "${c_grn}$(app_name "$scope" "$url") ${action%e}ed${c_off} (${scope}, $(manifest_get "$dir" VERSION "?"))"
+}
+
+update_one() { # scope url opts   (appends to global UPDATED array)
+    local scope="$1" url="$2" opts="${3:-}"
+    local name; name="$(app_name "$scope" "$url")"
+    if ! is_installed "$scope" "$url"; then
+        log "${c_dim}skipping $name (not installed)${c_off}"
+        return 0
+    fi
+    local dir; dir="$(scope_dir "$scope" "$url")"
+    # Against the MARKER, not the working tree. If a run was killed between the
+    # checkout and the installer — the unit has TimeoutStartSec=900 — the tree
+    # already sat on the target, so the next run saw HEAD == target and never
+    # applied the update that had not actually run.
+    local before; before="$(marker_sha "$dir")"
+    if ! sync_repo "$scope" "$url" "$opts" >/dev/null; then
+        # Not "up to date": nothing was checked. HEAD had simply not moved
+        # because ls-remote or fetch failed.
+        warn "$name: could not check for updates"
+        # Being offline is routine for the background timer, so --all only
+        # warns; an app asked for by name is a real failure.
+        (( ALL_MODE )) && return 0
+        return 1
+    fi
+    if [[ "$(local_head "$dir")" == "$before" && ${FORCE:-0} -eq 0 ]]; then
+        log "$name is up to date"
+        return 0
+    fi
+    run_installer "$scope" "$dir" update || {
+        warn "$name: the update step failed — keeping the recorded version, will retry next run"
+        return 1
+    }
+    write_marker "$dir"
+    info "${c_grn}$name updated${c_off} to $(manifest_get "$dir" VERSION "?")"
+    UPDATED+=("$name")
+}
+
+uninstall_one() { # scope url purge
+    local scope="$1" url="$2" purge="$3"
+    local name; name="$(app_name "$scope" "$url")"
+    local dir; dir="$(repos_dir "$scope")/$(dir_name "$url")"
+    if [[ -d $dir ]]; then
+        # The clone holds the only copy of this app's uninstaller. Deleting it
+        # after a failed run leaves the app's files on disk with nothing left
+        # that knows how to remove them.
+        if is_installed "$scope" "$url" && ! run_installer "$scope" "$dir" uninstall "$purge"; then
+            if (( FORCE )); then
+                warn "$name: the uninstaller failed — dropping $dir anyway (--force)"
+            else
+                warn "$name: the uninstaller failed, so its files are probably still there."
+                warn "  keeping $dir. Fix the cause and retry 'nova uninstall $name',"
+                warn "  or discard it with --force and clean up by hand."
+                return 1
+            fi
+        fi
+        rm -rf "${dir:?}"
+        info "${c_grn}$name uninstalled${c_off}"
+    else
+        log "$name is not installed"
+    fi
+    if [[ $purge -eq 1 ]]; then
+        local f; f="$(list_file "$scope")"
+        if list_has "$f" "$url"; then
+            list_drop "$f" "$url"
+            info "removed $name from $f"
+        fi
+    fi
+}
+
+# split requested names into per-scope url lists; escalate system work if needed
+# sets arrays: T_SCOPE T_URL T_OPTS
+collect_targets() { # all|names...
+    T_SCOPE=(); T_URL=(); T_OPTS=(); ALL_MODE=0
+    [[ $1 == --all ]] && ALL_MODE=1
+    local list=() url opts line n dir scs sc
+    if [[ $1 == --all ]]; then
+        while IFS=$'\t' read -r url opts; do
+            [[ -z $url ]] && continue
+            list+=("$(printf '%s\t%s' "$url" "${opts:-}")")
+        done < <(app_entries)
+    else
+        for n in "$@"; do
+            line="$(resolve "$n")" || die "unknown app: $n (check 'nova list')"
+            list+=("$line")
+        done
+    fi
+    for line in "${list[@]}"; do
+        IFS=$'\t' read -r url opts <<<"$line"
+        dir="$(sync_meta "$url" "$opts")" || { warn "cannot reach $url"; continue; }
+        scs="$(effective_scopes "$dir" "$opts" "$url")"
+        [[ -z $scs ]] && continue
+        for sc in $scs; do
+            # a scope filter on the invocation still narrows things
+            [[ -n $SCOPE_FILTER && $sc != "$SCOPE_FILTER" ]] && continue
+            T_SCOPE+=("$sc"); T_URL+=("$url"); T_OPTS+=("$opts")
+        done
+    done
+    if [[ ${#T_URL[@]} -eq 0 ]]; then
+        # "nothing to do" is not a failure for --all. The system timer runs
+        # `update --all --system` on machines that legitimately have no system
+        # apps, and dying there marked the unit failed every six hours.
+        [[ $1 == --all ]] && { log "nothing to do"; exit 0; }
+        die "no apps matched (see 'nova list')"
+    fi
+}
+
+# --dry-run: say exactly what would happen and change nothing. Deliberately
+# before the lock and before any escalation, so asking "what would this do?"
+# never blocks another run and never asks for a password.
+dry_run_plan() { # verb
+    local verb="$1" i sc url opts dir mdir inst pin target tsha tref dl
+    row() { (( QUIET )) || printf '    %-10s %s\n' "$1" "$2"; }
+    info "dry run — nothing below is actually done"
+    for i in "${!T_URL[@]}"; do
+        sc="${T_SCOPE[$i]}"; url="${T_URL[$i]}"; opts="${T_OPTS[$i]}"
+        dir="$(scope_dir "$sc" "$url")"
+        mdir="$(meta_dir)/$(dir_name "$url")"
+        inst="$(manifest_get "$mdir" INSTALLER install.sh)"
+        pin="$(entry_opt "$opts" ref "")"
+        [[ -z $pin ]] && pin="$(entry_opt "$opts" branch "")"
+        target="$(remote_target "$url" "$opts" || true)"
+        tsha=""; tref=""
+        [[ -n $target ]] && IFS=$'\t' read -r tsha tref <<<"$target"
+        (( QUIET )) || printf '  %s%s%s (%s scope)\n' \
+            "$c_bold" "$(app_name "$sc" "$url")" "$c_off" "$sc"
+        row action "$verb"
+        row url "$url"
+        row ref "${tref:-could not reach the remote}${tsha:+ -> $tsha}${pin:+  [pinned: $pin]}"
+        if is_installed "$sc" "$url"; then
+            row installed "$(marker_sha "$dir")"
+        else
+            row installed "no"
+            [[ $verb == update ]] && row note "would be skipped: not installed"
+        fi
+        row installer "$dir/$inst"
+        row prefix "$(prefix_for "$sc")"
+        if [[ $verb == install ]]; then
+            plan_deps "$sc" "$url" "$(manifest_get "$mdir" DEPENDS "")"
+            for dl in ${DEP_APPS[@]+"${DEP_APPS[@]}"}; do
+                row first "installs $(dir_name "${dl%%$'\t'*}"), a nova app this depends on"
+            done
+            for dl in ${DEP_ELSEWHERE[@]+"${DEP_ELSEWHERE[@]}"}; do
+                row needs "$dl, in another scope — install it first: nova install $dl"
+            done
+            if [[ ${#DEPS_MISSING[@]} -gt 0 ]]; then row missing "${DEPS_MISSING[*]}"; fi
+        fi
+        [[ $verb == uninstall ]] && row purge "$([[ ${PURGE:-0} == 1 ]] && echo yes || echo no)"
+        [[ $sc == system && $EUID -ne 0 ]] && row note "needs root — would escalate"
+    done
+    # explicitly: the loop's status is its last [[ ]], false for any user-scope
+    # target, and under set -e that made `install --dry-run` exit 1
+    return 0
+}
+
+dispatch() { # verb extra_flag
+    local verb="$1" i had_user=0 sys_names=() rc_pre=0 from_urls=()
+    for i in "${!T_URL[@]}"; do
+        [[ ${T_SCOPE[$i]} == user ]] && had_user=1
+        [[ ${T_SCOPE[$i]} == system && $EUID -ne 0 ]] || continue
+        # Updating or removing something requires it to be there in the first
+        # place. The default catalog lists an app with SCOPES=user system, so
+        # collecting every system target regardless meant a plain `nova update`
+        # on a default install announced "escalating for system apps" and asked
+        # for a password to touch a scope the machine does not even have.
+        if [[ $verb != install ]] && ! is_installed system "${T_URL[$i]}"; then
+            continue
+        fi
+        # Do not ask for a password for work that cannot succeed. The user side
+        # resolves a name from the user's catalogs and escalated by name; root
+        # resolves it again from root-owned lists only, so for an app that only
+        # a user-level catalog lists, the user authenticated and root answered
+        # "unknown app". Root refusing is right — asking first was the bug.
+        # Root knows only its own lists. For an install — always authenticated
+        # — pass the URL the user was shown along, and root records it (see the
+        # install case in main). The old behaviour refused here and sent people
+        # to `nova catalog add --system` first; and when no system scope existed
+        # at all it refused too, where root_nova below sets one up with one
+        # password. Both were the opposite of "install root parts with ease".
+        if [[ $verb == install ]] && ! root_knows "${T_URL[$i]}"; then
+            from_urls+=("${T_URL[$i]}")
+        fi
+        sys_names+=("$(app_name system "${T_URL[$i]}")")
+    done
+
+    if (( DRY_RUN )); then dry_run_plan "$verb"; return 0; fi
+
+    if (( had_user )); then acquire_lock user; fi
+    if [[ $EUID -eq 0 ]]; then acquire_lock system; fi
+
+    local rc=$rc_pre
+    UPDATED=()
+    for i in "${!T_URL[@]}"; do
+        [[ ${T_SCOPE[$i]} == system && $EUID -ne 0 ]] && continue
+        case "$verb" in
+            install)   install_one   "${T_SCOPE[$i]}" "${T_URL[$i]}" "${T_OPTS[$i]}" || rc=1 ;;
+            update)    update_one    "${T_SCOPE[$i]}" "${T_URL[$i]}" "${T_OPTS[$i]}" || rc=1 ;;
+            uninstall) uninstall_one "${T_SCOPE[$i]}" "${T_URL[$i]}" "${PURGE:-0}"   || rc=1 ;;
+        esac
+    done
+
+    # System UPDATES go through a fixed-purpose root wrapper when present:
+    # passwordless for local wheel users (polkit exec rule on that one path).
+    # It used to update every system app regardless of what you asked for,
+    # because no argument could be passed to root safely. It now takes names
+    # and validates them against the root-owned system list, so a selection
+    # picks among apps root already trusts rather than supplying anything new.
+    # install/uninstall still require full authentication.
+    local extra=()
+    (( PURGE )) && extra+=(--purge)
+    (( FORCE )) && extra+=(--force)
+    [[ $GUI_CHOICE == 0 ]] && extra+=(--cli-only)
+    [[ $GUI_CHOICE == 1 ]] && extra+=(--gui)
+
+    # The wrapper carries names and nothing else — that is what makes it safe
+    # to run without a password. So it cannot carry --force or a GUI choice,
+    # and those used to be dropped on the floor for the system half: `nova
+    # update --force app` forced the user half and quietly did a plain update
+    # as root. With any such flag, ask for root directly instead.
+    local sys_wrapper=/usr/local/libexec/nova-system-update
+    if [[ $verb == update && ${#sys_names[@]} -gt 0 && $EUID -ne 0 && -x $sys_wrapper &&
+          ${#extra[@]} -gt 0 ]]; then
+        info "${extra[*]} cannot go through the passwordless wrapper — asking for root directly"
+    fi
+    if [[ $verb == update && ${#sys_names[@]} -gt 0 && $EUID -ne 0 && -x $sys_wrapper &&
+          ${#extra[@]} -eq 0 ]]; then
+        # Ask for exactly the apps that were requested. The wrapper validates
+        # each name against the root-owned system list and refuses anything
+        # else, so updating one app no longer means updating all of them.
+        info "updating system app(s) without a password: ${sys_names[*]}"
+        if pkexec "$sys_wrapper" "${sys_names[@]}" 9>&-; then
+            sys_names=()
+            info "${c_grn}system apps updated${c_off}"
+        else
+            warn "system update wrapper failed — falling back to direct escalation"
+        fi
+    fi
+
+    if [[ ${#sys_names[@]} -gt 0 && ${NOVA_UNATTENDED:-0} == 1 ]]; then
+        # The background timer: never prompt, never hang on a dialog nobody is
+        # there to answer. Without the passwordless wrapper (manual mode, or it
+        # failed) the system halves simply wait for the next interactive update.
+        log "${c_dim}system half of ${sys_names[*]} needs a password — left for your next 'nova update'${c_off}"
+        sys_names=()
+    fi
+
+    if [[ ${#sys_names[@]} -gt 0 ]]; then
+        # Say what root is for before asking for it. "Needs your password" with
+        # no reason is how people learn to type it without reading.
+        local i2 d2 why
+        for i2 in "${!T_URL[@]}"; do
+            [[ ${T_SCOPE[$i2]} == system ]] || continue
+            d2="$(meta_dir)/$(dir_name "${T_URL[$i2]}")"
+            why="$(manifest_get "$d2" ROOT_REASON "")"
+            [[ -n $why ]] && info "  ${c_bold}$(app_name system "${T_URL[$i2]}")${c_off} needs root: $why"
+        done
+        info "escalating for system apps: ${sys_names[*]}"
+        # Capture first. root_nova dies when it cannot provide a root-owned
+        # copy, and inside $(...) that exit leaves only the subshell — the
+        # caller went on to run `pkexec "" update --system …`.
+        local rk; rk="$(root_nova)" || return 1
+        local u; for u in ${from_urls[@]+"${from_urls[@]}"}; do extra+=(--from "$u"); done
+        as_root "$rk" "$verb" --system "${sys_names[@]}" "${extra[@]+"${extra[@]}"}" 9>&- || rc=1
+    fi
+
+    if [[ $verb == update && ${#UPDATED[@]} -gt 0 ]]; then
+        notify "Apps updated" "$(printf '%s, ' "${UPDATED[@]}" | sed 's/, $//')"
+    fi
+
+    (( had_user )) && sync_app_folder
+    [[ $verb == update && $EUID -ne 0 ]] && note_root_skew
+    return $rc
+}
+
+# maintain a "Nova Tools" folder in the GNOME app grid, grouping every
+# installed Nova app that ships a desktop entry (eu.novanetwork.*). Rebuilt
+# from what's actually present, so it self-heals on install/uninstall.
+# User scope + a live GNOME session only; a no-op everywhere else.
+sync_app_folder() {
+    [[ $EUID -eq 0 ]] && return 0
+    command -v gsettings >/dev/null 2>&1 || return 0
+    [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} || -S "${XDG_RUNTIME_DIR:-/run/user/$UID}/bus" ]] || return 0
+
+    local appsdir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    local schema="org.gnome.desktop.app-folders"
+    local base="/org/gnome/desktop/app-folders/folders"
+    local ids=() f k id name apps
+    for f in "$appsdir"/eu.novanetwork.*.desktop; do
+        [[ -e $f ]] && ids+=("$(basename "$f")")
+    done
+
+    # Write only what changes. Every update used to rewrite name, apps and
+    # translate even when identical, which gives GNOME Shell a folder to
+    # re-render for no reason on every timer tick.
+    gset() { # schema key value
+        local cur; cur="$(gsettings get "$1" "$2" 2>/dev/null || true)"
+        [[ $cur == "$3" || "${cur//\'/}" == "${3//\'/}" ]] && return 0
+        gsettings set "$1" "$2" "$3" 2>/dev/null || true
+    }
+
+    local children; children="$(gsettings get "$schema" folder-children 2>/dev/null)" || return 0
+    local -a kids=(); local dup=0
+    while read -r k; do
+        [[ -n $k ]] || continue
+        for id in ${kids[@]+"${kids[@]}"}; do [[ $id == "$k" ]] && { dup=1; continue 2; }; done
+        kids+=("$k")
+    done < <(grep -o "'[^']*'" <<<"$children" | tr -d "'")
+    if (( dup )); then
+        # two nova runs appending at the same moment (an install while the
+        # timer fires) can list an id twice, and Shell shows one folder per
+        # listing
+        children="$(printf "'%s', " "${kids[@]}")"; children="[${children%, }]"
+        gsettings set "$schema" folder-children "$children" 2>/dev/null || true
+    fi
+
+    # ADOPT before creating. A folder the user made for these apps by hand has
+    # an id of GNOME's choosing and whatever name they typed; building ours
+    # next to it produced two folders called "Nova Tools" holding the same
+    # apps, and the second one came back after every update. Prefer a folder
+    # that already holds any of our apps, then one carrying our name, and only
+    # then our own id.
+    local target=""
+    for id in ${kids[@]+"${kids[@]}"}; do
+        apps="$(gsettings get "$schema.folder:$base/$id/" apps 2>/dev/null || true)"
+        for f in ${ids[@]+"${ids[@]}"}; do
+            [[ $apps == *"'$f'"* ]] && { target="$id"; break 2; }
+        done
+    done
+    if [[ -z $target ]]; then
+        for id in ${kids[@]+"${kids[@]}"}; do
+            name="$(gsettings get "$schema.folder:$base/$id/" name 2>/dev/null | tr -d "'" || true)"
+            [[ ${name,,} == "nova tools" ]] && { target="$id"; break; }
+        done
+    fi
+    [[ -z $target ]] && target="nova-tools"
+    local path="$base/$target/"
+
+    drop_ours() { # remove the nova-tools folder from the grid
+        gsettings reset-recursively "$schema.folder:$base/nova-tools/" 2>/dev/null || true
+        children="$(sed "s/'nova-tools', //; s/, 'nova-tools'//; s/'nova-tools'//" <<<"$children")"
+        gsettings set "$schema" folder-children "$children" 2>/dev/null || true
+    }
+
+    # whichever folder is the one, a second nova-tools next to it is the bug
+    [[ $target != nova-tools && $children == *"'nova-tools'"* ]] && drop_ours
+
+    if [[ ${#ids[@]} -eq 0 ]]; then
+        # no Nova GUI apps left: drop OUR folder if we had it. One the user
+        # made is theirs and stays.
+        [[ $target == nova-tools && $children == *"'nova-tools'"* ]] && drop_ours
+        return 0
+    fi
+
+    # merge: keep whatever else the folder already holds, add ours
+    local current; current="$(gsettings get "$schema.folder:$path" apps 2>/dev/null || echo "[]")"
+    local -a have=(); local seen
+    while read -r k; do [[ -n $k ]] && have+=("$k"); done < <(grep -o "'[^']*'" <<<"$current" | tr -d "'")
+    for f in ${ids[@]+"${ids[@]}"}; do
+        seen=0; for k in ${have[@]+"${have[@]}"}; do [[ $k == "$f" ]] && seen=1; done
+        (( seen )) || have+=("$f")
+    done
+    local apps_str="[" first=1
+    for k in ${have[@]+"${have[@]}"}; do (( first )) && first=0 || apps_str+=", "; apps_str+="'$k'"; done
+    apps_str+="]"
+
+    if [[ $target == nova-tools ]]; then
+        gset "$schema.folder:$path" name "'Nova Tools'"
+        gset "$schema.folder:$path" translate false
+    fi
+    gset "$schema.folder:$path" apps "$apps_str"
+
+    if [[ $children != *"'$target'"* ]]; then
+        if [[ $children == "@as []" || $children == "[]" ]]; then
+            gsettings set "$schema" folder-children "['$target']" 2>/dev/null || true
+        else
+            gsettings set "$schema" folder-children "${children%]}, '$target']" 2>/dev/null || true
+        fi
+    fi
+}
+
+# ---------- commands --------------------------------------------------------
+cmd_list() {
+    local porcelain=$PORCELAIN check=0 nosync=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --porcelain) porcelain=1 ;;
+            --check)     check=1 ;;
+            --no-sync)   nosync=1 ;;
+            *) die "unknown option: $1" ;;
+        esac; shift
+    done
+    (( check )) && sync_catalogs
+    (( nosync )) || sync_all_meta
+
+    local url opts dir name comp comp_full ver desc scs lbl status target tsha tref sc
+    local found=0 inst miss any_root=0 inst_scs pin_ref
+    (( porcelain )) || printf '%s%-20s %-12s %-22s %-9s %-17s %s%s\n' \
+        "$c_bold" NAME SCOPES COMPONENTS VERSION STATUS DESCRIPTION "$c_off"
+    while IFS=$'\t' read -r url opts; do
+        [[ -z $url ]] && continue
+        found=1
+        (( check )) && refresh_meta "$url" "$opts"
+        # read the details out of the clone the app was installed from, so the
+        # version shown is the version running
+        dir="$(installed_dir "$url")"
+        name="$(manifest_name "$dir" "$(dir_name "$url")")"
+        comp="$(manifest_get "$dir" COMPONENTS "$(manifest_get "$dir" TYPE "?")")"
+        ver="$(manifest_get "$dir" VERSION "-")"
+        comp_full="$comp"
+        (( ${#comp} > 22 )) && comp="${comp:0:21}…"
+        desc="$(manifest_get "$dir" DESCRIPTION "")"
+        scs="$(effective_scopes "$dir" "$opts" "$url")"
+        [[ -z $scs ]] && scs="$(entry_opt "$opts" scope user)"
+        lbl="$(scope_label $scs)"
+        [[ $scs == *system* ]] && { lbl="$lbl*"; any_root=1; }
+
+        inst=0; miss=0; inst_scs=""
+        for sc in $scs; do
+            if is_installed "$sc" "$url"; then
+                inst=1; inst_scs="${inst_scs:+$inst_scs }$sc"
+            else
+                miss=1
+            fi
+        done
+        pin_ref="$(entry_opt "$opts" ref "")"
+        tref=""
+        if (( inst )) && (( ! miss )); then
+            status="installed"
+        elif (( inst )); then
+            status="partial"
+        else
+            status="not-installed"
+        fi
+        if (( inst )); then
+            # a cli+gui app on a headless box really did only get the CLI.
+            # Once, not once per scope — a dual-scope app read "(cli-only)
+            # (cli-only)".
+            if [[ $comp == *gui* ]]; then
+                for sc in $scs; do
+                    if is_installed "$sc" "$url" && [[ "$(marker_gui "$sc" "$url")" == 0 ]]; then
+                        comp="$comp (cli-only)"; break
+                    fi
+                done
+            fi
+            if (( check )); then
+                target="$(remote_target "$url" "$opts" || true)"
+                IFS=$'\t' read -r tsha tref <<<"$target"
+                if [[ -z ${tsha:-} ]]; then status="unreachable"
+                elif [[ -n "$(outdated_scopes "$url" "$opts" "$tsha")" ]]; then status="update-available"; fi
+            fi
+        fi
+
+        if (( porcelain )); then
+            # porcelain carries the real values; truncation is for humans only.
+            # APPEND new fields only — the GUI indexes by position.
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$name" "$scs" "$comp_full" "$status" "$ver" "$url" "$desc" "${tref:-}" \
+                "$(manifest_get "$dir" CATEGORY "")" \
+                "$(manifest_get "$dir" TAGS "")" "$dir" \
+                "$(manifest_get "$dir" ROOT_REASON "")" \
+                "$inst_scs" "$pin_ref"
+        else
+            local col=""
+            [[ $status == update-available ]] && col="$c_ylw"
+            [[ $status == installed ]] && col="$c_grn"
+            [[ $status == partial ]] && col="$c_ylw"
+            printf '%-20s %-12s %-22s %-9s %s%-17s%s %s\n' \
+                "$name" "$lbl" "$comp" "$ver" "$col" "$status" "$c_off" "$desc"
+        fi
+    done < <(app_entries)
+    if (( found )); then
+        (( porcelain )) || (( ! any_root )) || \
+            log "${c_dim}* needs root for part of the install${c_off}"
+    else
+        log "${c_dim}no apps configured — add one with: nova add <git-url>${c_off}"
+    fi
+}
+
+cmd_search() { # term...
+    [[ $# -gt 0 ]] || die "usage: nova search <term>"
+    local term url opts dir name desc comp hits=0
+    term="$(printf '%s ' "$@")"; term="${term% }"
+    sync_catalogs
+    sync_all_meta
+    while IFS=$'\t' read -r url opts; do
+        [[ -z $url ]] && continue
+        dir="$(meta_dir)/$(dir_name "$url")"
+        name="$(manifest_name "$dir" "$(dir_name "$url")")"
+        desc="$(manifest_get "$dir" DESCRIPTION "")"
+        comp="$(manifest_get "$dir" COMPONENTS "")"
+        # categories and tags are the whole point of tagging an app; leaving
+        # them out of search meant `nova search security` found nothing in a
+        # catalog full of Security-category tools
+        if printf '%s %s %s %s %s %s' "$name" "$desc" "$comp" \
+                "$(manifest_get "$dir" CATEGORY "")" \
+                "$(manifest_get "$dir" TAGS "")" "$url" \
+                | grep -qiF -- "$term"; then
+            hits=1
+            printf '%s%-20s%s %s\n' "$c_bold" "$name" "$c_off" "$desc"
+            printf '  %s%s%s\n' "$c_dim" "$url" "$c_off"
+        fi
+    done < <(app_entries)
+    (( hits )) || { log "nothing matched '$term'"; return 1; }
+}
+
+# which of an app's declared dependencies are actually present — looked up in
+# the PATH that scope's installer will get, not nova's own. nova-fox's plugins
+# declare DEPENDS=nova-fox, a command nova-fox installs into ~/.local/bin; from
+# a user manager without the desktop's environment, nova's own PATH reported it
+# missing on every update while the installer would have found it.
+deps_missing() { # "a b c" [scope] -> missing ones
+    local scope="${2:-}" d out=()
+    if [[ -z $scope ]]; then
+        if [[ $EUID -eq 0 ]]; then scope=system; else scope=user; fi
+    fi
+    split_words "${1:-}"                     # manifest data: no globbing
+    (   PATH="$(installer_path "$scope")"; hash -r
+        for d in ${WORDS[@]+"${WORDS[@]}"}; do
+            command -v -- "$d" >/dev/null 2>&1 || out+=("$d")
+        done
+        echo "${out[*]:-}" )
+}
+
+# ---------------------------------------------------------------------------
+# App-level dependencies. A DEPENDS word is normally a command (podman, git)
+# that nova only checks for. When it is not found and names a nova app, that
+# app is installed first: `nova install nova-plugin-tor` brings nova-fox.
+#
+# Three limits, each the fix for a way this went wrong when it first shipped:
+#   - it installs in THIS process, never inside $(…), where the dependency's
+#     whole output was captured into the "missing" list and came back as a
+#     warning that the app it had just installed was "not here";
+#   - only in the dependent's own scope — anything else ran a system install
+#     unprivileged, or a user install as root into /root. For those nova says
+#     which command to run instead;
+#   - only from a list that also names the dependent (its own catalog) or a
+#     list on this machine. Resolved against every registered catalog, a word
+#     like secret-tool installed whatever repo of that name ANY catalog listed:
+#     code nobody chose, behind a name any hostile catalog could claim.
+# ---------------------------------------------------------------------------
+
+# every list file naming <url>: the catalogs it comes from, any local list
+entry_sources() { # url
+    local u o src want; want="$(norm_url "$1")"
+    while IFS=$'\t' read -r src u o; do
+        [[ -n $u && "$(norm_url "$u")" == "$want" ]] && printf '%s\n' "$src"
+    done < <(app_entries_raw)
+}
+
+# the nova app a DEPENDS word names, looked up only where that is allowed
+# (see above): "url<TAB>opts", or nothing
+dep_app() { # word dependent_url
+    local word="$1" homes u o src
+    homes="$(entry_sources "$2")"
+    [[ -n $homes ]] || return 1
+    while IFS=$'\t' read -r src u o; do
+        [[ -n $u && "$(dir_name "$u")" == "$word" ]] || continue
+        if [[ "$(entry_opt "$o" local 0)" != 1 ]] && ! grep -qxF -- "$src" <<<"$homes"; then
+            continue
+        fi
+        valid_url "$u" || continue
+        printf '%s\t%s\n' "$u" "$o"; return 0
+    done < <(app_entries_raw)
+    return 1
+}
+
+# What an install would do about an app's DEPENDS, without doing it. The one
+# answer that install, --dry-run and info all report. Sets
+#   DEP_APPS       "url<TAB>opts" of nova apps to install first, in this scope
+#   DEP_ELSEWHERE  nova apps it needs that install in another scope
+#   DEPS_MISSING   commands that are missing and that no nova app provides
+plan_deps() { # scope url "a b c"
+    local scope="$1" url="$2" d line u o dd
+    DEP_APPS=(); DEP_ELSEWHERE=(); DEPS_MISSING=()
+    split_words "$(deps_missing "$3" "$scope")"     # looked up in the installer's PATH
+    local -a need=(${WORDS[@]+"${WORDS[@]}"})
+    for d in ${need[@]+"${need[@]}"}; do
+        if ! line="$(dep_app "$d" "$url")"; then
+            DEPS_MISSING+=("$d"); continue
+        fi
+        IFS=$'\t' read -r u o <<<"$line"
+        is_installed "$scope" "$u" && continue
+        if ! dd="$(sync_meta "$u" "$o")"; then
+            warn "cannot reach $u, which $(dir_name "$url") needs"
+            DEPS_MISSING+=("$d"); continue
+        fi
+        if [[ " $(effective_scopes "$dd" "$o" "$u") " == *" $scope "* ]]; then
+            DEP_APPS+=("$line")
+        else
+            DEP_ELSEWHERE+=("$(dir_name "$u")")
+        fi
+    done
+}
+
+# Install the nova apps <url> depends on, before <url> itself. Leaves the
+# commands still missing in DEPS_MISSING for the caller's warning.
+ensure_deps() { # scope url "a b c"
+    local scope="$1" url="$2" line u o n
+    plan_deps "$scope" "$url" "$3"
+    # copies: the installs below recurse into plan_deps and reset the globals
+    local -a apps=(${DEP_APPS[@]+"${DEP_APPS[@]}"}) other=(${DEP_ELSEWHERE[@]+"${DEP_ELSEWHERE[@]}"})
+    local -a missing=(${DEPS_MISSING[@]+"${DEPS_MISSING[@]}"})
+    for n in ${other[@]+"${other[@]}"}; do
+        warn "$(dir_name "$url") needs $n, which installs in a different scope."
+        warn "  install it first:  nova install $n"
+    done
+    for line in ${apps[@]+"${apps[@]}"}; do
+        IFS=$'\t' read -r u o <<<"$line"
+        if [[ " ${NOVA_DEP_STACK:-} " == *" $(norm_url "$u") "* ]]; then
+            warn "dependency cycle through $(dir_name "$u"); not following it again"
+            continue
+        fi
+        info "$(dir_name "$url") needs $(dir_name "$u") — installing that first"
+        NOVA_DEP_STACK="${NOVA_DEP_STACK:-} $(norm_url "$url")" install_one "$scope" "$u" "$o" ||
+            warn "$(dir_name "$u") did not install, so $(dir_name "$url") may not work"
+    done
+    DEPS_MISSING=(${missing[@]+"${missing[@]}"})
+}
+
+cmd_info() { # [--porcelain] [--installer] name
+    local porcelain=0 show_inst=0
+    while [[ ${1:-} == --* ]]; do
+        case "$1" in
+            --porcelain) porcelain=1 ;;
+            --installer) show_inst=1 ;;
+            *) die "unknown option for info: $1" ;;
+        esac
+        shift
+    done
+    [[ $# -eq 1 ]] || die "usage: nova info [--porcelain] [--installer] <app>"
+    local line url opts dir scs sc
+
+    # Print the script before the first install, not after. An app's installer
+    # is the whole of what installing it does, and for these tools it is short
+    # enough to read.
+    if (( show_inst )); then
+        line="$(resolve "$1")" || die "unknown app: $1"
+        IFS=$'\t' read -r url opts <<<"$line"
+        dir="$(sync_meta "$url" "$opts")" || die "cannot reach $url"
+        scs="$(effective_scopes "$dir" "$opts" "$url")"
+        local inst; inst="$(manifest_get "$dir" INSTALLER install.sh)"
+        [[ -f "$dir/$inst" ]] || die "there is no installer '$inst' in $dir"
+        info "$inst from $url"
+        [[ $scs == *system* ]] &&
+            info "${c_ylw}this app declares the system scope, so nova runs this as root${c_off}"
+        log ""
+        cat "$dir/$inst"
+        return 0
+    fi
+
+    if (( porcelain )); then
+        line="$(resolve "$1")" || die "unknown app: $1"
+        IFS=$'\t' read -r url opts <<<"$line"
+        dir="$(sync_meta "$url" "$opts")" || die "cannot reach $url"
+        scs="$(effective_scopes "$dir" "$opts" "$url")"
+        local deps; deps="$(manifest_get "$dir" DEPENDS "")"
+        printf 'name=%s\n'        "$(manifest_name "$dir" "$(dir_name "$url")")"
+        printf 'description=%s\n' "$(manifest_get "$dir" DESCRIPTION "")"
+        printf 'version=%s\n'     "$(manifest_get "$dir" VERSION "-")"
+        printf 'components=%s\n'  "$(manifest_get "$dir" COMPONENTS "")"
+        printf 'scopes=%s\n'      "$scs"
+        printf 'root_reason=%s\n' "$(manifest_get "$dir" ROOT_REASON "")"
+        printf 'homepage=%s\n'    "$(manifest_get "$dir" HOMEPAGE "")"
+        printf 'license=%s\n'     "$(manifest_get "$dir" LICENSE "")"
+        printf 'category=%s\n'    "$(manifest_get "$dir" CATEGORY "")"
+        printf 'tags=%s\n'        "$(manifest_get "$dir" TAGS "")"
+        printf 'author=%s\n'      "$(manifest_get "$dir" AUTHOR "")"
+        printf 'depends=%s\n'     "$deps"
+        # the same answer an install acts on: nova apps it would install
+        # first are not "missing"; apps in another scope and plain commands are
+        local iscope=user; [[ $EUID -eq 0 ]] && iscope=system
+        local dl inst_first=()
+        plan_deps "$iscope" "$url" "$deps"
+        for dl in ${DEP_APPS[@]+"${DEP_APPS[@]}"}; do inst_first+=("$(dir_name "${dl%%$'\t'*}")"); done
+        printf 'depends_missing=%s\n' "$(echo ${DEPS_MISSING[@]+"${DEPS_MISSING[@]}"} ${DEP_ELSEWHERE[@]+"${DEP_ELSEWHERE[@]}"})"
+        printf 'depends_installs=%s\n' "${inst_first[*]:-}"
+        printf 'icon=%s\n'        "$(manifest_get "$dir" ICON "")"
+        printf 'screenshots=%s\n' "$(manifest_get "$dir" SCREENSHOTS "")"
+        printf 'about=%s\n'       "$(manifest_get "$dir" ABOUT README.md)"
+        printf 'repo_dir=%s\n'    "$dir"
+        printf 'url=%s\n'         "$url"
+        printf 'pinned=%s\n'      "$(entry_opt "$opts" ref "")"
+        printf 'installer=%s\n'   "$(manifest_get "$dir" INSTALLER install.sh)"
+        for sc in $scs; do
+            printf 'installed_%s=%s\n' "$sc" "$(is_installed "$sc" "$url" && echo 1 || echo 0)"
+        done
+        return 0
+    fi
+
+    line="$(resolve "$1")" || die "unknown app: $1"
+    IFS=$'\t' read -r url opts <<<"$line"
+    dir="$(sync_meta "$url" "$opts")" || die "cannot reach $url"
+    # effective_scopes, the same as cmd_list: what the entry and manifest
+    # declare PLUS any scope the app is actually installed in. With app_scopes
+    # here, `nova info nova-updater` reported scopes=user and printed no
+    # installed_system line at all, while `nova list` said user+system — so the
+    # GUI detail view, which is built from info, had no root row to show.
+    scs="$(effective_scopes "$dir" "$opts" "$url")"
+    printf '%s%s%s\n' "$c_bold" "$(manifest_name "$dir" "$(dir_name "$url")")" "$c_off"
+    printf '  %s\n\n' "$(manifest_get "$dir" DESCRIPTION "")"
+    printf '  %-12s %s\n' version    "$(manifest_get "$dir" VERSION "-")"
+    printf '  %-12s %s\n' components "$(manifest_get "$dir" COMPONENTS "$(manifest_get "$dir" TYPE "?")")"
+    printf '  %-12s %s\n' scopes     "$(scope_label $scs)"
+    printf '  %-12s %s\n' source     "$url"
+    local ideps imiss; ideps="$(manifest_get "$dir" DEPENDS "")"
+    if [[ -n $ideps ]]; then
+        printf '  %-12s %s\n' depends "$ideps"
+        local iscope=user dl first=()
+        [[ $EUID -eq 0 ]] && iscope=system
+        plan_deps "$iscope" "$url" "$ideps"
+        for dl in ${DEP_APPS[@]+"${DEP_APPS[@]}"}; do first+=("$(dir_name "${dl%%$'\t'*}")"); done
+        [[ ${#first[@]} -gt 0 ]] && printf '  %-12s %s\n' "installs" "${first[*]} first, when you install this"
+        imiss="$(echo ${DEPS_MISSING[@]+"${DEPS_MISSING[@]}"} ${DEP_ELSEWHERE[@]+"${DEP_ELSEWHERE[@]}"})"
+        [[ -n $imiss ]] && printf '  %-12s %s%s%s\n' missing "$c_ylw" "$imiss" "$c_off"
+    fi
+    local hp lic; hp="$(manifest_get "$dir" HOMEPAGE "")"; lic="$(manifest_get "$dir" LICENSE "")"
+    [[ -n $hp ]]  && printf '  %-12s %s\n' homepage "$hp"
+    [[ -n $lic ]] && printf '  %-12s %s\n' license  "$lic"
+    for sc in $scs; do
+        printf '  %-12s %s\n' "installed" \
+            "$(is_installed "$sc" "$url" && echo "yes ($sc)" || echo "no ($sc)")"
+    done
+    local ipin; ipin="$(entry_opt "$opts" ref "")"
+    [[ -n $ipin ]] && printf '  %-12s %s%s%s\n' pinned "$c_ylw" "$ipin" "$c_off"
+    if [[ $scs == *system* ]]; then
+        printf '\n  %sThis app needs root.%s %s\n' "$c_ylw" "$c_off" \
+            "$(manifest_get "$dir" ROOT_REASON "it installs files and services outside your home directory")"
+    fi
+}
+
+# One source of truth with cmd_list: app_entries for what exists, the per-scope
+# marker for what is installed. The old version still used the pre-manifest
+# model where a catalog entry without scope= was user-only, so it reported
+# "everything is up to date" and exited 0 while a system app from a catalog had
+# an update waiting.
+# ---------- pin / unpin -----------------------------------------------------
+# ref= on a list entry has always existed; this makes it a command, so "stay on
+# this tag until I say otherwise" no longer means hand-editing apps.list. The
+# cheapest real protection there is: code only changes when you say so.
+
+# 0 = the ref exists, 1 = it does not, 2 = could not reach the remote
+ref_exists() { # url ref
+    remote_target "$1" "" >/dev/null 2>&1 || return 2
+    remote_target "$1" "ref=$2" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+pin_apply() { # app value   ("" clears the pin)
+    local app="$1" val="${2:-}" scope=user f line url opts rc=0
+    [[ $SCOPE_FILTER == system ]] && scope=system
+    if [[ $scope == system && $EUID -ne 0 ]]; then
+        local rk; rk="$(root_nova)" || return 1
+        if [[ -n $val ]]; then as_root "$rk" pin --system "$app" "$val" 9>&-
+        else                   as_root "$rk" unpin --system "$app" 9>&-
+        fi
+        return
+    fi
+    line="$(resolve "$app")" || die "unknown app: $app (check 'nova list')"
+    IFS=$'\t' read -r url opts <<<"$line"
+    f="$(list_file "$scope")"
+    if [[ -n $val ]]; then
+        # The value is written into a space-separated list file as ref=<val>,
+        # so a value with whitespace would corrupt the entry — and when the
+        # remote cannot be reached to disprove a typo, "pinning anyway" below
+        # would write it. Refuse the shape before anything touches the file.
+        [[ $val =~ ^[A-Za-z0-9][A-Za-z0-9._/@+-]*$ ]] ||
+            die "that does not look like a tag or branch name: '$val'"
+        ref_exists "$url" "$val" || rc=$?
+        (( rc == 1 )) && die "$(dir_name "$url") has no tag or branch called '$val'"
+        (( rc == 2 )) && warn "could not reach $url to confirm '$val' exists — pinning anyway"
+    fi
+    list_set_opt "$f" "$url" ref "$val" || die "could not update $f"
+    if [[ -n $val ]]; then
+        info "${c_grn}$(dir_name "$url") pinned to $val${c_off} in $f"
+        info "  it stays there until 'nova unpin $(dir_name "$url")'"
+    else
+        info "${c_grn}$(dir_name "$url") unpinned${c_off} in $f — it follows its latest release again"
+        # Pinning a catalog app had to add a local entry, because that is what
+        # overrides a catalog. Unpinning should put the list back rather than
+        # leave a bare line behind that outranks the catalog from then on.
+        if [[ -z "$(entry_opts "$f" "$url")" ]] && catalog_has_url "$url"; then
+            list_drop "$f" "$url"
+            info "  and dropped the local entry it needed — the catalog lists it again"
+        fi
+    fi
+    # A pin in the user list holds only the user half. The system half is
+    # updated by root's timer from root-owned lists, which this did not touch —
+    # so "code only changes when I say so" would quietly not cover the part
+    # that runs as root. Say so, with the exact command.
+    if [[ $scope == user ]] && is_installed system "$url"; then
+        if [[ -n $val ]]; then
+            warn "the system half of $(dir_name "$url") follows root's own list; this pin does not hold it."
+            warn "  to hold it too (one password prompt):  nova pin --system $(dir_name "$url") $val"
+        else
+            warn "the system half of $(dir_name "$url") follows root's own list; it was not unpinned here."
+            warn "  if it carries its own pin, clear it with:  nova unpin --system $(dir_name "$url")"
+        fi
+    fi
+}
+
+cmd_pin() {
+    [[ $# -eq 2 ]] || die "usage: nova pin <app> <tag-or-branch> [--system]"
+    pin_apply "$1" "$2"
+}
+
+cmd_unpin() {
+    [[ $# -eq 1 ]] || die "usage: nova unpin <app> [--system]"
+    pin_apply "$1" ""
+}
+
+# ---------- diff ------------------------------------------------------------
+# What an update would actually change, before it changes it. The marker is the
+# record of what is installed, so this is simply marker..target — and the
+# installer gets shown in full, because for a catalog of small tools that is
+# the code that is about to run as you or as root, and it is short enough to
+# read.
+cmd_diff() {
+    [[ $# -eq 1 ]] || die "usage: nova diff <app> [--user|--system]"
+    local app="$1" line url opts sc dir from target tsha tref inst n=0
+    line="$(resolve "$app")" || die "unknown app: $app (check 'nova list')"
+    IFS=$'\t' read -r url opts <<<"$line"
+
+    for sc in $(real_scopes); do
+        is_installed "$sc" "$url" || continue
+        [[ -n $SCOPE_FILTER && $sc != "$SCOPE_FILTER" ]] && continue
+        n=$((n+1))
+        dir="$(scope_dir "$sc" "$url")"
+        if ! git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+            # root-owned clone, read as the user: git refuses it outright
+            warn "$(app_name "$sc" "$url") ($sc) is installed in a clone this user cannot read."
+            warn "  try: sudo nova diff --system $app"
+            continue
+        fi
+        from="$(marker_sha "$dir")"
+        target="$(remote_target "$url" "$opts" || true)"
+        [[ -n $target ]] || { warn "cannot reach $url"; continue; }
+        IFS=$'\t' read -r tsha tref <<<"$target"
+        info "$(app_name "$sc" "$url") ($sc): $tref"
+        if [[ $from == "$tsha" ]]; then
+            log "  already on that commit — an update would change nothing"
+            continue
+        fi
+        git_net -C "$dir" fetch --quiet --tags origin 2>/dev/null ||
+            warn "could not fetch — showing only what is already local"
+        if ! git -C "$dir" rev-parse --quiet --verify "$from^{commit}" >/dev/null 2>&1; then
+            warn "the installed commit $from is not in the remote history any more"
+            continue
+        fi
+        log ""
+        log "${c_bold}commits${c_off}"
+        git -C "$dir" log --oneline --no-decorate "$from..$tsha" 2>/dev/null | sed 's/^/  /'
+        log ""
+        log "${c_bold}files${c_off}"
+        git -C "$dir" diff --stat "$from" "$tsha" 2>/dev/null | sed 's/^/  /'
+        inst="$(manifest_get "$dir" INSTALLER install.sh)"
+        log ""
+        if git -C "$dir" diff --quiet "$from" "$tsha" -- "$inst" 2>/dev/null; then
+            log "${c_dim}$inst is unchanged${c_off}"
+        else
+            log "${c_ylw}$inst changes — this is the script that runs on update${c_off}"
+            git -C "$dir" diff "$from" "$tsha" -- "$inst" 2>/dev/null | sed 's/^/  /'
+        fi
+    done
+    (( n )) || die "$app is not installed, so there is nothing to compare.
+'nova info --installer $app' shows the script a first install would run."
+}
+
+cmd_check() {
+    sync_catalogs
+    local url opts sc n=0 target tsha tref
+    while IFS=$'\t' read -r url opts; do
+        [[ -z $url ]] && continue
+        # only installed apps are worth a network round trip
+        is_installed_any "$url" || continue
+        target="$(remote_target "$url" "$opts" || true)"
+        IFS=$'\t' read -r tsha tref <<<"$target"
+        [[ -n ${tsha:-} ]] || continue
+        for sc in $(outdated_scopes "$url" "$opts" "$tsha"); do
+            [[ -n $SCOPE_FILTER && $sc != "$SCOPE_FILTER" ]] && continue
+            log "${c_ylw}update available:${c_off} $(app_name "$sc" "$url") ($sc) -> $tref"
+            n=$((n+1))
+        done
+    done < <(app_entries)
+    if (( n > 0 )); then
+        notify "Updates available" "$n app(s) can be updated"
+        log "$n update(s) available"
+        return 10
+    fi
+    log "everything is up to date"
+}
+
+# ---------- doctor ----------------------------------------------------------
+# Every condition here is one that used to be invisible until it bit someone:
+# a stale lock that failed every command, a root copy frozen three releases
+# back, a list root would silently ignore, a clone whose origin no longer
+# matches its entry, a timer that never got enabled because the install
+# aborted. Exits non-zero when something needs attention.
+cmd_doctor() {
+    local problems=0 sc d lock who host pid f st owner mode url opts dir have
+    local me; me="$(hostname 2>/dev/null || echo unknown)"
+    _bad()  { warn "$*"; problems=$((problems+1)); }
+    _good() { log "  ${c_grn}ok${c_off}    $*"; }
+    _note() { log "  ${c_ylw}note${c_off}  $*"; }
+
+    info "tools"
+    for f in git awk sed grep flock timeout; do
+        if command -v "$f" >/dev/null 2>&1; then _good "$f"
+        else _bad "$f is missing — nova needs git, coreutils, util-linux and awk"; fi
+    done
+
+    info "versions"
+    _good "this copy is $NOVA_VERSION ($0)"
+    if have="$(root_version)"; then
+        if [[ $have == "$NOVA_VERSION" ]]; then
+            _good "root-owned copy at $ROOT_NOVA is $have ($(system_mode) mode)"
+        else
+            _bad "root-owned copy at $ROOT_NOVA is $have, this one is $NOVA_VERSION.
+$(root_skew_advice "$have")"
+        fi
+    else
+        _good "no system scope installed (nothing runs as root)"
+    fi
+
+    info "locks"
+    for sc in $(real_scopes); do
+        [[ $sc == system ]] && d="$SYS_DATA_DIR" || d="$USER_DATA_DIR"
+        lock="$d/lock"
+        if [[ ! -f $lock ]]; then _good "$sc: no lock file"; continue; fi
+        who="$(head -1 "$lock" 2>/dev/null || true)"
+        host="${who%% *}"; pid="${who#*pid=}"; pid="${pid%% *}"; pid="${pid//[!0-9]/}"
+        if [[ ! -w $lock ]]; then
+            _note "$sc: $lock is not writable by this user, cannot test it"
+        elif ( exec 8<>"$lock" && flock -n 8 ) 2>/dev/null; then
+            _good "$sc: free"
+        elif [[ $host == "$me" && -n $pid ]] && ! kill -0 "$pid" 2>/dev/null; then
+            _bad "$sc: lock held but pid $pid is gone — stale. Remove $lock"
+        else
+            _note "$sc: held right now${who:+ by $who}"
+        fi
+    done
+
+    info "list files"
+    # The user's own lists are checked too. They decide which installers run as
+    # you, so one that anyone else on the machine can write is a way to get code
+    # executed as you — the same reasoning as the root-owned rule, one privilege
+    # level down. They were missing here entirely.
+    local want_owner
+    for f in "$USER_LIST" "$USER_CATALOGS" "$SYS_LIST" "$SYS_CATALOGS"; do
+        if [[ ! -e $f ]]; then
+            case "$f" in
+                "$USER_LIST"|"$USER_CATALOGS") _note "$f does not exist yet" ;;
+            esac
+            continue
+        fi
+        st="$(stat -c '%u %a' "$f" 2>/dev/null)" || continue
+        read -r owner mode <<<"$st"
+        case "$f" in
+            "$SYS_LIST"|"$SYS_CATALOGS") want_owner=0 ;;
+            *)                           want_owner=$EUID ;;
+        esac
+        if [[ $owner != "$want_owner" ]]; then
+            if (( want_owner == 0 )); then
+                _bad "$f is not owned by root — root ignores it. chown root $f"
+            else
+                _bad "$f is owned by uid $owner, not you. chown $EUID $f"
+            fi
+        elif (( (8#$mode & 8#022) != 0 )); then
+            _bad "$f is writable by group or other (mode $mode) — anything written
+  there runs as the owner of that scope. chmod 644 $f"
+        else
+            _good "$f (mode $mode)"
+        fi
+    done
+
+    info "clones"
+    # Everything the user side knows about a system app is read out of
+    # /var/lib: installed or not, which commit, whether an update is due. A
+    # root umask of 077 makes those clones unreadable, and then every system
+    # app looks not-installed from here with nothing saying why.
+    if [[ $EUID -ne 0 && -d $SYS_REPOS ]]; then
+        if [[ ! -r $SYS_REPOS || ! -x $SYS_REPOS ]]; then
+            _bad "$SYS_REPOS is not readable by users, so system apps look not-installed from here.
+  sudo chmod 755 $SYS_DATA_DIR $SYS_REPOS"
+        else
+            for d in "$SYS_REPOS"/*/; do
+                [[ -d $d ]] || continue
+                [[ -r $d && -x $d && -r "$d/.nova-installed" || ! -e "$d/.nova-installed" ]] ||
+                    _bad "$(basename "$d") (system) is not readable by users; the user view of it is wrong.
+  sudo chmod -R a+rX $d"
+            done
+        fi
+    fi
+    while IFS=$'\t' read -r url opts; do
+        [[ -z $url ]] && continue
+        for sc in $(real_scopes); do
+            is_installed "$sc" "$url" || continue
+            dir="$(scope_dir "$sc" "$url")"
+            have="$(repo_origin "$dir")"
+            if [[ -n $have ]] && [[ "$(norm_url "$have")" != "$(norm_url "$url")" ]]; then
+                _bad "$(dir_name "$url") ($sc) was installed from $have but the list says $url.
+  Updates refuse to switch source silently. Remove it first: nova uninstall $(dir_name "$url")"
+            elif [[ -z "$(marker_sha "$dir")" ]]; then
+                _bad "$(dir_name "$url") ($sc) has an installed marker with no commit in it: $dir"
+            else
+                _good "$(dir_name "$url") ($sc)"
+            fi
+        done
+    done < <(app_entries)
+
+    info "background updates"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        _note "no systemctl here, so nothing to check"
+    else
+        if [[ $EUID -ne 0 ]]; then
+            if [[ "$(systemctl --user is-enabled nova-updater.timer 2>/dev/null || true)" == enabled ]]; then
+                _good "user timer is enabled"
+            else
+                _bad "the user update timer is not enabled.
+  systemctl --user enable --now nova-updater.timer"
+            fi
+        fi
+        if [[ -x $ROOT_NOVA ]]; then
+            # System halves are updated from the USER timer through the
+            # passwordless wrapper; there is no root timer any more. The
+            # wrapper is world-executable, so its presence can be checked from
+            # here (the polkit rule itself lives in a root-only directory).
+            local wrap=/usr/local/libexec/nova-system-update
+            if [[ $(system_mode) == manual ]]; then
+                if [[ -x $wrap ]]; then
+                    _bad "manual mode, but the passwordless wrapper is still installed.
+  re-run:  install.sh install --with-system=manual"
+                else
+                    _good "manual mode: every system change asks for a password; the timer leaves system halves for your next 'nova update'"
+                fi
+            elif [[ -x $wrap ]]; then
+                _good "system halves update from your timer through the passwordless wrapper"
+            else
+                _bad "the system scope is installed but the update wrapper is missing.
+  re-run the bootstrap:  get-nova.sh --with-system"
+            fi
+            if [[ "$(systemctl is-enabled nova-updater-system.timer 2>/dev/null || true)" == enabled ]]; then
+                _bad "the old root timer from nova <= 1.8 is still enabled; the next self-update removes it, or:
+  sudo systemctl disable --now nova-updater-system.timer"
+            fi
+        fi
+    fi
+
+    log ""
+    if (( problems )); then
+        log "${c_ylw}$problems thing(s) need attention${c_off}"
+        return 1
+    fi
+    log "${c_grn}no problems found${c_off}"
+}
+
+cmd_add() {
+    local url="" system=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --system) system=1 ;;
+            -*) die "unknown option: $1" ;;
+            *) url="$1" ;;
+        esac; shift
+    done
+    [[ -n $url ]] || die "usage: nova add <git-url> [--system]"
+    valid_url "$url" || die "not a usable git url: '$url'
+expected https://…, http://… or an absolute path to a local repo."
+    [[ $url == http://* ]] && warn "http:// is not encrypted; anyone on the path can change what you install"
+    local scope=user f
+    (( system )) && scope=system
+    # There is no useful root "user" list: `nova add <url>` from a root shell
+    # means the system list, or it means nothing at all. It used to write to
+    # /root/.config, which no scope ever reads back.
+    if [[ $EUID -eq 0 && $scope == user ]]; then
+        scope=system
+        info "running as root — adding to the system list"
+    fi
+    f="$(list_file "$scope")"
+    if [[ $scope == system && $EUID -ne 0 ]]; then
+        local rk; rk="$(root_nova)" || return 1
+        as_root "$rk" add --system "$url"
+        return
+    fi
+    mkdir -p "$(dirname "$f")"; touch "$f"
+    list_has "$f" "$url" && die "already in $f"
+    echo "$url" >> "$f"
+    info "added $(dir_name "$url") to $scope list — install it with: nova install $(dir_name "$url")"
+}
+
+# a catalog may describe itself in catalog.manifest (NAME/DESCRIPTION/...)
+catalog_meta() { # dir key default
+    local v=""
+    [[ -f "$1/catalog.manifest" ]] && \
+        v="$(grep -E "^$2=" "$1/catalog.manifest" 2>/dev/null | head -1 | cut -d= -f2-)"
+    echo "${v:-$3}"
+}
+
+cmd_catalog() { # add <url> | list      (--system routes to the system file)
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+        add)
+            local url="${1:-}"
+            [[ -n $url ]] || die "usage: nova catalog add <git-url> [--system]"
+            valid_url "$url" || die "not a usable git url: '$url'
+expected https://…, http://… or an absolute path to a local repo."
+            [[ $url == http://* ]] && warn "http:// is not encrypted; anyone on the path can change what you install"
+            local f="$USER_CATALOGS"
+            [[ $SCOPE_FILTER == system ]] && f="$SYS_CATALOGS"
+            if [[ $f == "$SYS_CATALOGS" && $EUID -ne 0 ]]; then
+                local rk; rk="$(root_nova)" || return 1
+                as_root "$rk" catalog add "$url" --system
+                return
+            fi
+            mkdir -p "$(dirname "$f")"; touch "$f"
+            list_has "$f" "$url" && die "catalog already registered in $f"
+            # Catalogs are cloned into a directory named after the repo, so two
+            # catalogs called e.g. org1/catalog and org2/catalog shared one
+            # directory: the second was never cloned, its apps never appeared,
+            # and removing it deleted the first one's clone.
+            local other
+            while read -r other _; do
+                [[ -n ${other:-} && "$(dir_name "$other")" == "$(dir_name "$url")" ]] &&
+                    die "a catalog directory called '$(dir_name "$url")' is already in use by $other
+Both would share one clone. Rename the repo, or use a fork with a distinct name."
+            done < <(catalog_urls)
+            # A catalog is a list of repos whose install scripts you will run.
+            # Anything in it that declares the system scope runs as root. Say so
+            # once, plainly, at the only moment the decision is being made.
+            warn "a catalog lets its apps run their own installers on this machine,"
+            warn "and apps that declare the system scope run them as root."
+            warn "only add catalogs you trust: $url"
+            echo "$url" >> "$f"
+            sync_catalogs
+            local cd2; cd2="$(catalogs_dir)/$(dir_name "$url")"
+            info "added $(catalog_meta "$cd2" NAME "$(dir_name "$url")") — $(catalog_meta "$cd2" DESCRIPTION 'no description')"
+            info "its apps now show up in 'nova list'"
+            ;;
+        list)
+            local url2 d2 n2 ds2 apps2
+            while read -r url2 _; do
+                [[ -z ${url2:-} ]] && continue
+                d2="$(catalogs_dir)/$(dir_name "$url2")"
+                n2="$(catalog_meta "$d2" NAME "$(dir_name "$url2")")"
+                ds2="$(catalog_meta "$d2" DESCRIPTION '')"
+                # NOT `$(grep -c … || echo 0)`: grep -c prints its 0 AND exits
+                # 1, so the fallback appended a second line and the two-line
+                # value broke this row of the porcelain the GUI parses.
+                apps2=0
+                [[ -f "$d2/apps.list" ]] && \
+                    apps2="$(grep -Evc '^[[:space:]]*(#|$)' "$d2/apps.list" 2>/dev/null)" || true
+                if (( PORCELAIN )); then
+                    printf '%s\t%s\t%s\t%s\n' "$n2" "$url2" "$apps2" "$ds2"
+                else
+                    printf '%s%-24s%s %s\n' "$c_bold" "$n2" "$c_off" "$ds2"
+                    printf '  %s%s  ·  %s app(s)%s\n' "$c_dim" "$url2" "$apps2" "$c_off"
+                fi
+            done < <(catalog_urls)
+            ;;
+        remove)
+            local url="${1:-}"
+            [[ -n $url ]] || die "usage: nova catalog remove <git-url> [--system]"
+            local f="$USER_CATALOGS"
+            [[ $SCOPE_FILTER == system ]] && f="$SYS_CATALOGS"
+            if [[ $f == "$SYS_CATALOGS" && $EUID -ne 0 ]]; then
+                local rk; rk="$(root_nova)" || return 1
+                as_root "$rk" catalog remove "$url" --system
+                return
+            fi
+            list_has "$f" "$url" || die "not registered in $f"
+            list_drop "$f" "$url"
+            local cdir; cdir="$(catalogs_dir)/$(dir_name "$url")"
+            rm -rf "${cdir:?}"
+            info "catalog removed (installed apps stay until uninstalled)"
+            ;;
+        *) die "usage: nova catalog add|remove <git-url> [--system] | nova catalog list" ;;
+    esac
+}
+
+cmd_self_update() {
+    # Go through the same path as any other app, so self-update expands into
+    # the scopes the manifest declares instead of re-deriving them here. This
+    # used to unpack resolve's output as scope/url/opts, which stopped being
+    # its shape when scope moved into the manifest — and the symptom was nova
+    # quietly reporting itself "not installed" and doing nothing.
+    collect_targets nova-updater
+    dispatch update
+}
+
+usage() {
+    cat <<EOF
+nova $NOVA_VERSION — install and update open-source apps from git catalogs
+
+  nova list [--check]        every app this machine knows about (--no-sync to skip fetching)
+  nova search <term>         find an app across all registered catalogs
+  nova info <app>            what it is, what it installs, whether it needs root
+  nova info --installer <a>  print the script an install would run, before it runs
+  nova diff <app>            what an update would change, including its installer
+  nova pin <app> <tag>       stay on that tag; nova unpin <app> to follow releases again
+  nova install <app>|--all   install (or re-install) an app; --all needs asking for
+  nova update [<app>]|--all  update everything that has a new release
+  nova uninstall <app>       remove it  (--purge also drops its config)
+  nova check                 exit 10 if anything has an update
+
+  nova add <git-url>         track one repo directly, without a catalog
+  nova catalog add <url>     register a catalog of apps
+  nova catalog list|remove   manage registered catalogs
+  nova sync                  refresh catalogs now
+  nova self-update           update nova itself
+  nova doctor                check this install for the things that go wrong quietly
+
+Options: --user / --system (limit to one scope), --cli-only / --gui,
+         --purge, --force, --dry-run, --quiet, --notify, --version
+
+Options may go anywhere, before the command included. An unknown one is an
+error rather than an app name, and -- ends the options.
+
+An app declares the scopes it needs in its nova.manifest, so a catalog lists it
+once even when it has both a root service and a desktop component. Apps marked
+with * in 'nova list' need root for part of their install; 'nova info' says why.
+
+  user apps:      $USER_PREFIX   (no root, survives an ostree rebase)
+  system apps:    $SYS_PREFIX
+  user list:      $USER_LIST
+  system list:    $SYS_LIST
+  user catalogs:  $USER_CATALOGS
+  system catalogs:$SYS_CATALOGS
+EOF
+}
+
+# ---------- main ------------------------------------------------------------
+SCOPE_FILTER=""
+FORCE=0
+ALL_MODE=0
+PURGE=0
+PORCELAIN=0
+DRY_RUN=0
+GUI_CHOICE=""      # ""=auto/keep, 0=cli-only, 1=with-gui (install/update)
+FROM_URLS=()       # install --from <url>: root records the URL it is installing
+DEP_APPS=(); DEP_ELSEWHERE=(); DEPS_MISSING=()   # plan_deps results
+ARGS=()
+CMD=""
+
+# Options may appear anywhere, the command included, and an unknown one is an
+# error. Options used to be read only from $2 onwards, so `nova --quiet list`
+# took "--quiet" as the command name, and anything unrecognised fell through to
+# the app names — a typo answered "unknown app: --frce" instead of saying it
+# was not an option.
+end_of_opts=0
+take() { if [[ -z $CMD ]]; then CMD="$1"; else ARGS+=("$1"); fi; }
+
+while [[ $# -gt 0 ]]; do
+    if (( end_of_opts )); then take "$1"; shift; continue; fi
+    case "$1" in
+        --user)     SCOPE_FILTER=user ;;
+        --system)   SCOPE_FILTER=system ;;
+        --quiet)    QUIET=1 ;;
+        --notify)   NOTIFY=1 ;;
+        --force)    FORCE=1 ;;
+        --purge)    PURGE=1 ;;
+        --porcelain) PORCELAIN=1 ;;
+        --dry-run)  DRY_RUN=1 ;;
+        --cli-only|--no-gui) GUI_CHOICE=0 ;;
+        --gui|--with-gui)    GUI_CHOICE=1 ;;
+        --version)  [[ -z $CMD ]] || die "unknown option: $1"; CMD=version ;;
+        --from)     [[ -n ${2:-} ]] || die "--from needs a git url"; FROM_URLS+=("$2"); shift ;;
+        -h|--help)  [[ -z $CMD ]] || die "unknown option: $1"; CMD=help ;;
+        # read by a subcommand rather than here
+        --all|--check|--no-sync|--installer) ARGS+=("$1") ;;
+        # end of options: everything after this is a name, never a flag. The
+        # root wrapper passes its validated selection after a --.
+        --)         end_of_opts=1 ;;
+        -*)         die "unknown option: $1 (see 'nova help')" ;;
+        *)          take "$1" ;;
+    esac
+    shift
+done
+
+command -v git >/dev/null 2>&1 || die "git is required (rpm-ostree install git)"
+
+# once per invocation, for the commands that resolve or list apps
+case "$CMD" in
+    list|search|info|show|check|install|update|uninstall|self-update|pin|unpin|diff|doctor)
+        check_lists ;;
+esac
+
+case "$CMD" in
+    list)        cmd_list ${ARGS[@]+"${ARGS[@]}"} ;;
+    search)      cmd_search ${ARGS[@]+"${ARGS[@]}"} ;;
+    info|show)   info_args=(); (( PORCELAIN )) && info_args=(--porcelain)
+                 cmd_info ${info_args[@]+"${info_args[@]}"} ${ARGS[@]+"${ARGS[@]}"} ;;
+    check)       cmd_check ;;
+    add)         add_args=(); [[ $SCOPE_FILTER == system ]] && add_args=(--system)
+                 cmd_add ${ARGS[@]+"${ARGS[@]}"} ${add_args[@]+"${add_args[@]}"} ;;
+    catalog)     cmd_catalog ${ARGS[@]+"${ARGS[@]}"} ;;
+    sync)        sync_catalogs; sync_all_meta; refresh_all_meta; info "catalogs synced" ;;
+    # No implicit --all. `nova install` with no arguments installed every app in
+    # every registered catalog, running each one's installer — including, on a
+    # default install, apps that ask for root. `nova update` with no arguments
+    # still means "everything already installed", which is a safe default.
+    install)     [[ ${#ARGS[@]} -gt 0 ]] ||
+                     die "usage: nova install <app>... | --all   (--all installs every listed app)"
+                 # Root resolves names against its OWN lists. An install is
+                 # always authenticated, so when the user side hands over the
+                 # URL it showed the user (--from), root records it first: an
+                 # admin typing a password for "install this repo as root" is
+                 # exactly the decision the root list exists to record.
+                 # Passwordless updates later still touch only what it names.
+                 if [[ $EUID -eq 0 && ${#FROM_URLS[@]} -gt 0 ]]; then
+                     mkdir -p "$(dirname "$SYS_LIST")"; touch "$SYS_LIST"
+                     for from_url in "${FROM_URLS[@]}"; do
+                         valid_url "$from_url" || die "not a usable git url: '$from_url'"
+                         list_has "$SYS_LIST" "$from_url" ||
+                             { echo "$from_url" >> "$SYS_LIST"; info "registered $from_url for root"; }
+                     done
+                 fi
+                 sync_catalogs; collect_targets "${ARGS[@]}"; dispatch install ;;
+    update)      sync_catalogs; collect_targets "${ARGS[@]:---all}"; dispatch update ;;
+    uninstall)   [[ ${#ARGS[@]} -gt 0 ]] || die "usage: nova uninstall <name...>"
+                 collect_targets "${ARGS[@]}"; dispatch uninstall ;;
+    pin)         cmd_pin ${ARGS[@]+"${ARGS[@]}"} ;;
+    unpin)       cmd_unpin ${ARGS[@]+"${ARGS[@]}"} ;;
+    diff)        cmd_diff ${ARGS[@]+"${ARGS[@]}"} ;;
+    doctor)      cmd_doctor ;;
+    self-update) cmd_self_update ;;
+    # if-guarded: with no root copy the bare `[[ -n ]] &&` was the script's
+    # last command, so `nova version` exited 1 on every machine without the
+    # system scope — and broke anything scripted as `nova version && …`.
+    version)     echo "nova $NOVA_VERSION"
+                 if root_v="$(root_version)"; then
+                     echo "root-owned copy at $ROOT_NOVA: $root_v ($(system_mode) mode)"
+                 fi ;;
+    ""|help)     usage ;;
+    *)           die "unknown command: $CMD (see 'nova help')" ;;
+esac
