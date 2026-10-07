@@ -1,0 +1,14 @@
+# nova.manifest — app metadata for the nova updater (this file *is* the convention)
+NAME=nova-updater
+DESCRIPTION=Install and update open-source apps from git catalogs (CLI + GTK4 GUI)
+VERSION=2.2.0
+COMPONENTS=cli gui
+CATEGORY=System
+# from nova-icons (svg/classic/nova-updater.svg); install.sh installs the same
+# file as the desktop icon under the app id
+ICON=data/icons/eu.novanetwork.NovaUpdater.svg
+TAGS=updater installer catalog apps
+SCOPES=user
+HOMEPAGE=https://github.com/schlingel-bernd/nova-updater
+LICENSE=GPL-3.0-or-later
+INSTALLER=install.sh
