@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# nova-system-update — the one root entry point for system-app updates.
+#
+# The polkit rule authorises pkexec of THIS exact path for active wheel sessions,
+# so it must never become a way to run arbitrary things as root.
+#
+# It accepts app names, but treats them as a SELECTION rather than as input:
+# every name is checked against the root-owned system list before use, and
+# anything not already listed there is refused. The worst a caller can do is
+# update an app the administrator has already chosen to trust. With no names
+# it updates every one of them, which grants nothing that naming them all does
+# not.
+set -euo pipefail
+
+# pkexec gives us /usr/sbin:/usr/bin:/sbin:/bin:/root/bin, with no
+# /usr/local/bin. nova sets each installer's PATH itself (installer_path);
+# this is for nova and for anything else the system scope put in /usr/local.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+NOVA=/usr/local/bin/nova
+SYS_LIST=/etc/nova-updater/apps.list
+
+[[ -x $NOVA ]] || { echo "nova is not installed at $NOVA" >&2; exit 1; }
+
+if [[ $# -eq 0 ]]; then
+    exec "$NOVA" update --all --system --quiet
+fi
+
+# The set of apps root already trusts. Asking nova itself is the only correct
+# answer: an app can be trusted because it is in the root-owned apps.list OR
+# because it comes from a catalog registered for root, and re-deriving that
+# here would drift from the real resolution. --no-sync keeps this offline, so
+# a privileged call never fetches anything.
+known() {
+    "$NOVA" list --porcelain --no-sync 2>/dev/null \
+        | awk -F'\t' '$2 ~ /system/ { print $1 }'
+    # names straight from the root-owned list, in case a repo has no manifest
+    local url d
+    [[ -r $SYS_LIST ]] || return 0
+    while read -r url _; do
+        [[ -z ${url:-} ]] && continue
+        d="$(basename "${url%.git}")"
+        printf '%s\n' "$d"
+    done < <(grep -Ev '^[[:space:]]*(#|$)' "$SYS_LIST" 2>/dev/null || true)
+}
+
+mapfile -t KNOWN < <(known)
+for want in "$@"; do
+    # A bare app name: no paths, no options, no shell metacharacters. The first
+    # character must be alphanumeric — the old ^[A-Za-z0-9._-]+$ also matched
+    # --all, --force and --user, which only the known-apps check below stopped.
+    [[ $want =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "refusing name: $want" >&2; exit 2; }
+    ok=0
+    for k in ${KNOWN[@]+"${KNOWN[@]}"}; do
+        [[ $want == "$k" ]] && { ok=1; break; }
+    done
+    (( ok )) || { echo "not a system app on this machine: $want" >&2; exit 2; }
+done
+
+# `--` so a name can never be read as an option, whatever nova's option loop
+# grows into later.
+exec "$NOVA" update --system --quiet -- "$@"
