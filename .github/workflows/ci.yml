@@ -1,0 +1,31 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck -S warning bin/nova install.sh get-nova.sh \
+            data/nova-system-update data/bash-completion/nova \
+            templates/install.sh tests/*.sh
+      - name: the GUI has to at least parse
+        run: python3 -m py_compile gui/nova-gui
+      - name: release gate — version agrees, scripts executable in git
+        run: bash tests/check-version.sh
+
+  repro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The same command the README and FIXPLAN tell a developer to run, rather
+      # than a `container:` job: repro.sh needs root, useradd and a disposable
+      # filesystem, and running it through docker here means CI exercises the
+      # documented invocation instead of a second, untested one.
+      - name: findings stay fixed
+        run: |
+          docker run --rm -v "$PWD":/src:ro fedora:latest bash -c \
+            'dnf -y -q install git-core gawk util-linux shadow-utils procps-ng python3 >/dev/null &&
+             bash /src/tests/repro.sh'
