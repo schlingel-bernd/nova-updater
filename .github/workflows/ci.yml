@@ -1,0 +1,70 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: shellcheck
+        run: |
+          shellcheck -S warning bin/nova install.sh get-nova.sh \
+            data/nova-system-update data/bash-completion/nova \
+            templates/install.sh tests/*.sh
+      - name: the GUI has to at least parse
+        run: python3 -m py_compile gui/nova-gui
+      - name: release gate — version agrees, scripts executable in git
+        run: bash tests/check-version.sh
+
+  # Every supported distro (PORTPLAN tiers, T1/T2): repro.sh checks
+  # behaviour in detail with the network and root stubbed; smoke.sh does the
+  # real install a new user does, over the network. Through docker rather than
+  # a `container:` job: both need root, useradd and a disposable filesystem,
+  # and this is the invocation the README and the plans document.
+  distros:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fedora
+            image: docker.io/library/fedora:latest
+            setup: dnf -y -q install git-core gawk util-linux shadow-utils procps-ng python3 openssl openssh-clients
+          - name: debian-13
+            image: docker.io/library/debian:13
+            setup: apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git gawk util-linux passwd procps python3 openssl openssh-client ca-certificates
+          - name: ubuntu-24.04
+            image: docker.io/library/ubuntu:24.04
+            setup: apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git gawk util-linux passwd procps python3 openssl openssh-client ca-certificates
+          - name: arch
+            image: docker.io/library/archlinux:latest
+            setup: pacman -Syu --noconfirm --needed git gawk util-linux shadow procps-ng python openssl openssh
+          - name: opensuse-tumbleweed
+            image: docker.io/opensuse/tumbleweed:latest
+            setup: zypper -n -q in git-core gawk util-linux findutils shadow procps python3 openssl openssh-clients
+          - name: alpine
+            image: docker.io/library/alpine:latest
+            setup: apk add -q bash git gawk shadow procps-ng python3 openssl openssh-keygen util-linux coreutils findutils grep sed diffutils
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: repro.sh — findings stay fixed
+        run: |
+          docker run --rm -v "$PWD":/src:ro ${{ matrix.image }} sh -c \
+            '${{ matrix.setup }} >/dev/null && bash /src/tests/repro.sh'
+      - name: smoke.sh — a real install, over the network
+        run: |
+          docker run --rm -v "$PWD":/src:ro ${{ matrix.image }} sh -c \
+            '${{ matrix.setup }} >/dev/null && bash /src/tests/smoke.sh'
+
+  # Stock Alpine has BusyBox, which nova does not support (P2): it must stop at
+  # once with the line that installs the GNU tools, not fail halfway (T3).
+  busybox:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: nova names the packages instead of failing halfway
+        run: |
+          docker run --rm -v "$PWD":/src:ro docker.io/library/alpine:latest sh -c \
+            'apk add -q bash git >/dev/null && ! bash /src/bin/nova list >/tmp/out 2>&1 &&
+             grep -q "apk add bash coreutils util-linux findutils" /tmp/out && cat /tmp/out'
