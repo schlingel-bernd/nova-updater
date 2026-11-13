@@ -1,0 +1,20 @@
+[Unit]
+Description=Nova Updater — update your apps, including the root halves
+# No After=network-online.target: a system target means nothing in the user
+# manager. Being offline is handled where it matters — an update that cannot
+# reach a remote says so and leaves the recorded version alone — and the timer
+# is Persistent.
+
+[Service]
+Type=oneshot
+# Both scopes. System halves go through the passwordless wrapper (polkit grants
+# it to wheel users, user services included); nova's own root copy is just
+# another system half. There is no root timer.
+ExecStart=%h/.local/bin/nova update --all --quiet --notify
+# Never prompt from here: without the wrapper (manual mode) the system halves
+# are left for the next interactive update rather than a dialog at 3am.
+Environment=NOVA_UNATTENDED=1
+# A stuck run must not hold the scope lock indefinitely.
+TimeoutStartSec=900
+Nice=10
+IOSchedulingClass=idle
