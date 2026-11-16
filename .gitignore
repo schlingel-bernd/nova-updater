@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.swp
+CLAUDE.md
+.claude/*
+!.claude/skills/
+reference-fixes.patch
+FIXPLAN.md
