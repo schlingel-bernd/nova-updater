@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# nova-release — signed releases for a nova app, in two commands.
+#
+# nova installs an app's newest version tag, and root updates an app's system
+# half without a password only to a tag signed by the key it pinned for that
+# app (nova-updater's docs/signing.md). This tool does the author's side:
+#
+#   nova-release setup --key ~/.ssh/myapp-release   once per repo
+#   nova-release tag [--push]                       per release
+#   nova-release check [<tag>]                      who signed it?
+#
+# setup: writes .github/allowed_signers from the key's .pub, copies nova's
+#        release workflow to .github/workflows/release.yml, and sets this
+#        repo's git config (gpg.format=ssh, user.signingkey, tag.gpgSign).
+# tag:   tags v<VERSION from nova.manifest> on HEAD, signed; checks the tree
+#        is clean, the version is new and newer than every release, and
+#        tests/check-version.sh passes if the repo has one; verifies the
+#        signature against .github/allowed_signers; pushes with --push.
+#
+# It never reads the private key — git hands it to ssh-keygen — and it never
+# runs in CI: a workflow that can sign makes its token the key.
+set -euo pipefail
+
+RELEASE_RE='^v?[0-9]+(\.[0-9]+){0,3}$'      # what nova installs as a release
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+die()  { printf 'nova-release: %s\n' "$*" >&2; exit 1; }
+say()  { printf ':: %s\n' "$*"; }
+
+usage() {
+    cat <<'EOF'
+nova-release — signed releases for a nova app
+
+  nova-release setup --key <private-key-path> [--principal <name>]
+        make this repo release-ready: .github/allowed_signers, the release
+        workflow, and git config to sign tags with that SSH key
+  nova-release tag [--push]
+        sign v<VERSION> (from nova.manifest) on HEAD, verify it, push with --push
+  nova-release check [<tag>]
+        verify a tag (default: the newest release) against .github/allowed_signers
+
+Make a key once (a passphrase is recommended; ed25519-sk for a hardware key):
+  ssh-keygen -t ed25519 -C "<app> releases" -f ~/.ssh/<app>-release
+EOF
+}
+
+repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || die "not inside a git repository"
+}
+
+need_ssh_keygen() {
+    command -v ssh-keygen >/dev/null 2>&1 ||
+        die "ssh-keygen is needed (openssh-client / openssh-clients / openssh / openssh-keygen)"
+}
+
+# the release workflow nova ships; found next to this script in a checkout
+# (bin/../templates) or an installed copy (~/.local/share/nova-updater/…)
+release_template() {
+    local c
+    for c in "$SELF_DIR/../templates/release.yml" \
+             "${XDG_DATA_HOME:-$HOME/.local/share}/nova-updater/repos/nova-updater/templates/release.yml"; do
+        [[ -f $c ]] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+latest_release() { # -> the newest release version, without the v
+    git tag -l | grep -E "$RELEASE_RE" | sed 's/^v//' | sort -V | tail -1 || true
+}
+
+verify() { # tag
+    git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag -- "$1"
+}
+
+cmd_setup() {
+    local key="" principal=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --key)       key="${2:-}"; shift ;;
+            --principal) principal="${2:-}"; shift ;;
+            -h|--help)   usage; exit 0 ;;
+            *) die "unknown option for setup: $1" ;;
+        esac; shift
+    done
+    [[ -n $key ]] || die "usage: nova-release setup --key <private-key-path>"
+    need_ssh_keygen
+    key="$(readlink -f -- "$key")"
+    [[ -f "$key.pub" ]] || die "no public key at $key.pub (make one: ssh-keygen -t ed25519 -f $key)"
+    local root; root="$(repo_root)"; cd "$root"
+    [[ -f nova.manifest ]] || die "no nova.manifest here — run this in a nova app's repository"
+    local mode; mode="$(stat -c %a -- "$key" 2>/dev/null || echo "?")"
+    [[ $mode == 600 || $mode == 400 ]] ||
+        say "warning: $key is mode $mode; ssh-keygen will refuse to sign with it until: chmod 600 $key"
+
+    local pub; pub="$(awk '{print $1, $2}' "$key.pub")"
+    [[ $pub =~ ^(ssh-ed25519|sk-ssh-ed25519@openssh\.com|ecdsa-sha2-nistp(256|384|521)|sk-ecdsa-sha2-nistp256@openssh\.com|ssh-rsa)\ [A-Za-z0-9+/=]+$ ]] ||
+        die "$key.pub does not look like an SSH public key"
+    [[ -n $principal ]] || principal="$(git config user.name 2>/dev/null | tr -c 'A-Za-z0-9._\n-' '-' || true)"
+    [[ -n $principal ]] || principal="maintainer"
+
+    mkdir -p .github/workflows
+    local line; line="$principal namespaces=\"git\" $pub"
+    if [[ -f .github/allowed_signers ]] && grep -qF -- "$pub" .github/allowed_signers; then
+        say ".github/allowed_signers already lists this key"
+    else
+        if [[ ! -f .github/allowed_signers ]]; then
+            printf '%s\n' \
+                "# Keys whose signatures on release tags the release workflow accepts." \
+                "# Format: ssh-keygen(1) ALLOWED SIGNERS. Each machine's root pins its own copy of" \
+                "# the key from the first release it installs; changing keys means users run" \
+                "#   nova trust --system <app>" \
+                "# so say so in the release notes. Written by nova-release setup." > .github/allowed_signers
+        fi
+        printf '%s\n' "$line" >> .github/allowed_signers
+        say "wrote .github/allowed_signers ($(ssh-keygen -lf "$key.pub" | awk '{print $2}'))"
+    fi
+
+    local tpl
+    if tpl="$(release_template)"; then
+        if [[ -f .github/workflows/release.yml && "$(cat "$tpl")" == "$(cat .github/workflows/release.yml)" ]]; then
+            say ".github/workflows/release.yml is nova's current one"
+        else
+            [[ -f .github/workflows/release.yml ]] && say "replacing .github/workflows/release.yml with nova's (signed tags only)"
+            cp -- "$tpl" .github/workflows/release.yml
+            say "wrote .github/workflows/release.yml"
+        fi
+    else
+        say "warning: nova's templates/release.yml not found — copy it from the nova-updater repo"
+    fi
+
+    git config gpg.format ssh
+    git config user.signingkey "$key"
+    git config tag.gpgSign true
+    say "this repo signs tags with $key (repo-local git config)"
+    say "next: commit .github/, then release with:  nova-release tag --push"
+}
+
+cmd_tag() {
+    local push=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --push) push=1 ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "unknown option for tag: $1" ;;
+        esac; shift
+    done
+    need_ssh_keygen
+    local root; root="$(repo_root)"; cd "$root"
+    [[ -f nova.manifest ]] || die "no nova.manifest here"
+    [[ -s .github/allowed_signers ]] || die "no .github/allowed_signers — run: nova-release setup --key <path>"
+    [[ "$(git config gpg.format || true)" == ssh && -n "$(git config user.signingkey || true)" ]] ||
+        die "this repo is not set up to sign — run: nova-release setup --key <path>"
+    [[ -z "$(git status --porcelain)" ]] || die "the working tree is not clean — commit first"
+
+    # VERSION the way nova reads it: first line, control characters and trailing space dropped
+    local version tag latest
+    version="$(sed -n 's/^VERSION=//p' nova.manifest | head -1 | tr -d '[:cntrl:]' | sed 's/[[:space:]]*$//')"
+    tag="v$version"
+    [[ $tag =~ $RELEASE_RE ]] || die "VERSION '$version' does not make a tag nova installs ($RELEASE_RE)"
+    git fetch --quiet --tags origin 2>/dev/null || say "warning: could not fetch tags from origin"
+    git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "$tag exists already — bump VERSION in nova.manifest"
+    latest="$(latest_release)"
+    if [[ -n $latest && "$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -1)" != "$version" ]]; then
+        die "$version is not newer than the newest release, $latest"
+    fi
+    if [[ -f tests/check-version.sh ]]; then
+        bash tests/check-version.sh || die "tests/check-version.sh failed"
+    fi
+    local up; up="$(git rev-parse -q --verify '@{upstream}' 2>/dev/null || true)"
+    [[ -z $up || "$(git rev-parse HEAD)" == "$up" ]] ||
+        say "warning: HEAD is not what $(git rev-parse --abbrev-ref '@{upstream}') points at — tagging HEAD anyway"
+
+    git tag -s "$tag" -m "$tag"
+    if ! verify "$tag" >/dev/null 2>&1; then
+        git tag -d "$tag" >/dev/null
+        die "$tag was signed, but not by a key in .github/allowed_signers — removed it again"
+    fi
+    say "signed $tag at $(git rev-parse --short HEAD): $(verify "$tag" 2>&1 | head -1)"
+    if (( push )); then
+        git push origin "refs/tags/$tag"
+        say "pushed $tag — the release workflow publishes it"
+    else
+        say "push it with:  git push origin $tag"
+    fi
+}
+
+cmd_check() {
+    need_ssh_keygen
+    local root; root="$(repo_root)"; cd "$root"
+    [[ -s .github/allowed_signers ]] || die "no .github/allowed_signers here"
+    local tag="${1:-}"
+    if [[ -z $tag ]]; then
+        tag="$(git tag -l | grep -E "$RELEASE_RE" | sort -V | tail -1 || true)"
+        [[ -n $tag ]] || die "no release tags here"
+    fi
+    if verify "$tag" 2>&1; then say "$tag: signed by a key in .github/allowed_signers"
+    else die "$tag: NOT signed by a key in .github/allowed_signers"; fi
+}
+
+case "${1:-}" in
+    setup) shift; cmd_setup "$@" ;;
+    tag)   shift; cmd_tag "$@" ;;
+    check) shift; cmd_check "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "unknown command: $1 (see nova-release --help)" ;;
+esac

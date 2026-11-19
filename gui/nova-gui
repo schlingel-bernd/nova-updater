@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""nova-gui — starts Nova Apps, the desktop app of nova-updater.
+
+The app is the Python package nova_apps: in a checkout it is in src/, an
+install has it in ~/.local/share/nova-updater/lib/ (install.sh). This file
+only finds it and runs it, so `nova-gui` works from both.
+"""
+import os
+import runpy
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+for _d in (os.path.join(_here, "..", "src"), os.path.join(_data, "nova-updater", "lib")):
+    if os.path.isfile(os.path.join(_d, "nova_apps", "__init__.py")):
+        sys.path.insert(0, os.path.realpath(_d))
+        break
+else:
+    sys.exit("nova-gui: Nova Apps is not installed completely (nova_apps is missing).\n"
+             "Reinstall nova: nova self-update, or run get-nova.sh again.")
+
+runpy.run_module("nova_apps.ui", run_name="__main__", alter_sys=True)
