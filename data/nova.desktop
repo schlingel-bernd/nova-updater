@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Nova Apps
+Comment=Browse, install and update open-source apps from git catalogs
+Exec=nova-gui
+Icon=eu.novanetwork.NovaUpdater
+Terminal=false
+Categories=System;Settings;PackageManager;
+Keywords=update;install;software;apps;store;git;nova;
