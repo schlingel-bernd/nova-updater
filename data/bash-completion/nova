@@ -1,0 +1,48 @@
+# shellcheck shell=bash
+# bash completion for nova — sourced, never executed, so no shebang
+#
+# App names come from `nova list --porcelain --no-sync`: --no-sync so pressing
+# Tab never starts a network fetch, and porcelain so the first field is exactly
+# the name `nova install` expects.
+#
+# They come from catalogs, i.e. from someone else, so they never go through
+# `compgen -W`: it EXPANDS its word list, and a repo called $(cmd).git ran cmd
+# on Tab — as root, in a root shell. Each name is matched as plain text instead.
+_nova() {
+    local cur prev cmds opts
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    cmds="list search info install update uninstall check doctor diff pin unpin
+          trust add catalog sync self-update version help"
+    opts="--user --system --quiet --notify --force --purge --porcelain --dry-run
+          --cli-only --gui --all --check --no-sync --installer --version --help"
+
+    if [[ $cur == -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "$opts" -- "$cur")
+        return
+    fi
+
+    local i verb=""
+    for (( i = 1; i < COMP_CWORD; i++ )); do
+        case "${COMP_WORDS[i]}" in
+            -*) ;;
+            *) verb="${COMP_WORDS[i]}"; break ;;
+        esac
+    done
+
+    case "$verb" in
+        "")
+            mapfile -t COMPREPLY < <(compgen -W "$cmds" -- "$cur") ;;
+        catalog)
+            mapfile -t COMPREPLY < <(compgen -W "add remove list" -- "$cur") ;;
+        info|show|install|update|uninstall|diff|pin|unpin|trust)
+            [[ $verb == pin && $prev != pin ]] && return   # second arg is a tag
+            COMPREPLY=()
+            local n
+            while IFS= read -r n; do
+                [[ $n =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $n == "$cur"* ]] && COMPREPLY+=("$n")
+            done < <(nova list --porcelain --no-sync 2>/dev/null | cut -f1) ;;
+    esac
+}
+complete -F _nova nova
